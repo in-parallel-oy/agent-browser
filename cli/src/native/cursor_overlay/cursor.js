@@ -104,8 +104,11 @@
       '  height: ' + cfg.size + 'px;',
       '  pointer-events: none;',
       '  border-radius: 50%;',
-      '  background: rgba(255, 255, 255, 0.65);',
-      '  border: 2px solid rgba(0, 0, 0, 0.45);',
+      // Heavier border + faint translucent fill so the ripple is legible
+      // against any background (white pages were eating the previous
+      // light-grey border).
+      '  background: rgba(0, 0, 0, 0.10);',
+      '  border: 3px solid rgba(0, 0, 0, 0.60);',
       '  opacity: 0;',
       '  will-change: transform, opacity;',
       '  transform: translate(-1000px, -1000px) scale(0);',
@@ -156,84 +159,39 @@
     }
   }
 
-  const state = { x: -1000, y: -1000, animation: null };
+  // The page side is intentionally just synchronous setters. Tween and
+  // click-ripple animation are driven from the Rust daemon side by issuing
+  // multiple Runtime.evaluate calls that step through interpolated values.
+  //
+  // Why daemon-driven? In headless Chrome with no display attached, both
+  // requestAnimationFrame AND setInterval/setTimeout get throttled (the
+  // page is treated as "hidden", so timers floor to ~1 Hz and rAF drops
+  // similarly). Off-main-thread WAAPI animations also stop advancing
+  // between captureScreenshot calls because the compositor isn't running
+  // continuously without a display surface. Whatever animation primitive
+  // we pick on the page side sees only one tick across the whole tween,
+  // so the cursor visibly jumps from start to end.
+  //
+  // The reliable path is to step from the daemon: each `setCursor` /
+  // `setRipple` call is a synchronous inline-style write, and the next
+  // captureScreenshot captures whatever was last written. By stepping
+  // through ~one update per captured frame, we get smooth visible motion
+  // across the recording.
+  const state = { x: -1000, y: -1000 };
 
-  function applyImmediate(x, y) {
+  function setCursor(x, y) {
     state.x = x;
     state.y = y;
     cursorEl.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
   }
 
-  function moveTo(x, y, ms) {
-    const duration = Math.max(
-      0,
-      typeof ms === 'number' ? ms : motionDefault,
-    );
-    const fromX = state.x;
-    const fromY = state.y;
-    if (duration === 0 || fromX < 0 || fromY < 0) {
-      applyImmediate(x, y);
-      return Promise.resolve();
-    }
-    if (state.animation) {
-      try {
-        state.animation.cancel();
-      } catch (_) {}
-    }
-    state.x = x;
-    state.y = y;
-    let anim;
-    try {
-      anim = cursorEl.animate(
-        [
-          { transform: 'translate(' + fromX + 'px, ' + fromY + 'px)' },
-          { transform: 'translate(' + x + 'px, ' + y + 'px)' },
-        ],
-        {
-          duration: duration,
-          easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
-          fill: 'forwards',
-        },
-      );
-    } catch (_) {
-      applyImmediate(x, y);
-      return Promise.resolve();
-    }
-    state.animation = anim;
-    return anim.finished.then(
-      () => undefined,
-      () => undefined,
-    );
-  }
-
-  function click(x, y) {
-    try {
-      rippleEl.animate(
-        [
-          {
-            transform: 'translate(' + x + 'px, ' + y + 'px) scale(0)',
-            opacity: 0.65,
-          },
-          {
-            transform: 'translate(' + x + 'px, ' + y + 'px) scale(2.2)',
-            opacity: 0,
-          },
-        ],
-        {
-          duration: cfg.clickMs,
-          easing: 'ease-out',
-          fill: 'forwards',
-        },
-      );
-    } catch (_) {
-      // WAAPI not available; ignore (cursor still tweens via fallback).
-    }
+  function setRipple(x, y, scale, opacity) {
+    rippleEl.style.transform =
+      'translate(' + x + 'px, ' + y + 'px) scale(' + scale + ')';
+    rippleEl.style.opacity = String(opacity);
   }
 
   function destroy() {
-    try {
-      if (state.animation) state.animation.cancel();
-    } catch (_) {}
     try {
       host.remove();
     } catch (_) {}
@@ -243,5 +201,14 @@
     } catch (_) {}
   }
 
-  window.__ab_cursor = { moveTo: moveTo, click: click, destroy: destroy, state: state };
+  // Public API. `motionDefault` is exposed so the daemon can read the page's
+  // resolved tween default (which may be 0 due to prefers-reduced-motion)
+  // without needing to recompute the same logic in Rust.
+  window.__ab_cursor = {
+    setCursor: setCursor,
+    setRipple: setRipple,
+    destroy: destroy,
+    state: state,
+    motionDefault: motionDefault,
+  };
 })();

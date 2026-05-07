@@ -1394,12 +1394,12 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             const VALID: &[&str] = &["start", "stop", "restart"];
             match rest.first().copied() {
                 Some("start") => {
-                    let (positional, cursor) = split_record_args(&rest[1..], "record start")?;
-                    let path = positional.first().ok_or_else(|| ParseError::MissingArguments {
+                    let parsed = split_record_args(&rest[1..], "record start")?;
+                    let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record start <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
-                    let url = positional.get(1);
+                    let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
                     if let Some(u) = url {
                         let url_str = if u.starts_with("http") || u.contains("://") {
@@ -1409,19 +1409,22 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                         };
                         cmd["url"] = json!(url_str);
                     }
-                    if let Some(c) = cursor {
+                    if let Some(n) = parsed.fps {
+                        cmd["fps"] = json!(n);
+                    }
+                    if let Some(c) = parsed.cursor {
                         cmd["cursor"] = c;
                     }
                     Ok(cmd)
                 }
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => {
-                    let (positional, cursor) = split_record_args(&rest[1..], "record restart")?;
-                    let path = positional.first().ok_or_else(|| ParseError::MissingArguments {
+                    let parsed = split_record_args(&rest[1..], "record restart")?;
+                    let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record restart <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
-                    let url = positional.get(1);
+                    let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
                     if let Some(u) = url {
                         let url_str = if u.starts_with("http") || u.contains("://") {
@@ -1431,7 +1434,10 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                         };
                         cmd["url"] = json!(url_str);
                     }
-                    if let Some(c) = cursor {
+                    if let Some(n) = parsed.fps {
+                        cmd["fps"] = json!(n);
+                    }
+                    if let Some(c) = parsed.cursor {
                         cmd["cursor"] = c;
                     }
                     Ok(cmd)
@@ -1700,25 +1706,50 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
     }
 }
 
+/// Result of `split_record_args`: positional args (path, optional url),
+/// optional `cursor` JSON object, optional capture-fps override.
+struct RecordArgs<'a> {
+    positional: Vec<&'a str>,
+    cursor: Option<Value>,
+    fps: Option<u32>,
+}
+
 /// Split a `record start`/`record restart` argument list into positional
-/// args (path, optional url) and an optional `cursor` JSON object.
+/// args (path, optional url) and the optional flag-driven overrides.
 ///
-/// Recognised cursor flags: `--cursor <theme>`, `--cursor-tween-ms <n>`,
-/// `--cursor-click-ms <n>`, `--cursor-size <n>`, `--cursor-motion <mode>`,
-/// `--cursor-block-clicks`. The first three pull a value from the next
-/// token; the last is a bare boolean. The cursor object is only emitted
-/// when at least one cursor flag was present.
-fn split_record_args<'a>(
-    args: &'a [&'a str],
-    context: &str,
-) -> Result<(Vec<&'a str>, Option<Value>), ParseError> {
+/// Recognised flags: `--record-fps <n>`; cursor: `--cursor <theme>`,
+/// `--cursor-tween-ms <n>`, `--cursor-click-ms <n>`, `--cursor-size <n>`,
+/// `--cursor-motion <mode>`, `--cursor-block-clicks`. The cursor object is
+/// only emitted when at least one cursor flag was present.
+fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArgs<'a>, ParseError> {
     let mut positional: Vec<&str> = Vec::new();
     let mut cursor_obj = serde_json::Map::new();
     let mut cursor_seen = false;
+    let mut fps: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         let tok = args[i];
         match tok {
+            "--record-fps" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --record-fps", context),
+                        usage: "record start <output> [url] --record-fps <integer 1-60>",
+                    })?;
+                let n: u32 = v.parse().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--record-fps expects a non-negative integer (got '{}')", v),
+                    usage: "record start <output> [url] --record-fps <integer 1-60>",
+                })?;
+                if !(1..=60).contains(&n) {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--record-fps must be between 1 and 60 (got {})", n),
+                        usage: "record start <output> [url] --record-fps <integer 1-60>",
+                    });
+                }
+                fps = Some(n);
+                i += 2;
+            }
             "--cursor" => {
                 let v = args
                     .get(i + 1)
@@ -1802,7 +1833,11 @@ fn split_record_args<'a>(
     } else {
         None
     };
-    Ok((positional, cursor))
+    Ok(RecordArgs {
+        positional,
+        cursor,
+        fps,
+    })
 }
 
 fn parse_react(rest: &[&str], id: &str) -> Result<Value, ParseError> {

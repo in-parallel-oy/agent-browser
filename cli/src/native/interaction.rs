@@ -95,7 +95,8 @@ pub async fn hover(
     // tween is fire-and-forget on hover -- blocking would add latency without
     // a corresponding visual benefit.
     if let Some(b) = cursor {
-        let _ = cursor_overlay::move_async(client, &effective_session_id, x, y, b.tween_ms).await;
+        let _ =
+            cursor_overlay::move_async(&b.client, &effective_session_id, x, y, b.tween_ms).await;
     }
     client
         .send_command_typed::<_, Value>(
@@ -936,9 +937,12 @@ async fn dispatch_click(
     // fidelity at the cost of ~tween_ms per click.
     if let Some(b) = cursor {
         if b.block_clicks {
+            // move_blocking takes a plain `&CdpClient` because it doesn't
+            // spawn -- it just steps the tween in the calling task.
             let _ = cursor_overlay::move_blocking(client, session_id, x, y, b.tween_ms).await;
         } else {
-            let _ = cursor_overlay::move_async(client, session_id, x, y, b.tween_ms).await;
+            // move_async needs the Arc to spawn a background stepping task.
+            let _ = cursor_overlay::move_async(&b.client, session_id, x, y, b.tween_ms).await;
         }
     }
 
@@ -989,8 +993,8 @@ async fn dispatch_click(
     // Trigger the click ripple right after the press so the visual lands on
     // the same frame the page sees the click. Fire-and-forget; the ripple
     // animates over ~150 ms regardless.
-    if cursor.is_some() {
-        let _ = cursor_overlay::click_pulse(client, session_id, x, y).await;
+    if let Some(b) = cursor {
+        let _ = cursor_overlay::click_pulse(&b.client, session_id, x, y, b.click_ms).await;
     }
 
     // Release

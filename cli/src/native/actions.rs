@@ -332,7 +332,9 @@ impl DaemonState {
     /// sessions).
     pub fn cursor_bridge(&self) -> Option<super::cursor_overlay::CursorBridge> {
         self.cursor_script_id.as_ref()?;
-        self.cursor_overlay.as_ref().map(|c| c.bridge())
+        let cfg = self.cursor_overlay.as_ref()?;
+        let client = self.browser.as_ref()?.client.clone();
+        Some(cfg.bridge(client))
     }
 
     /// Extract the timeout from a command JSON, falling back to the
@@ -585,6 +587,7 @@ impl DaemonState {
             client,
             session_id,
             self.recording_state.output_path.clone(),
+            self.recording_state.fps,
             shared_count.clone(),
             cancel_rx,
         );
@@ -4065,6 +4068,15 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 
     let viewport = state.viewport;
 
+    // Optional capture fps override. Absence = use the recording_state default
+    // (30 fps). Validate before any context-creation work so a bad value
+    // can't leave a half-built recording behind.
+    let fps = match cmd.get("fps").and_then(|v| v.as_u64()) {
+        Some(n) => recording::validate_fps(n as u32)?,
+        None => recording::DEFAULT_CAPTURE_FPS,
+    };
+    state.recording_state.fps = fps;
+
     // Parse optional cursor overlay config. Absence = cursor disabled. Errors
     // here surface to the user before the recording context is created so a
     // typo'd `--cursor` value doesn't silently produce a cursor-less video.
@@ -4281,6 +4293,14 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'path' parameter")?;
+
+    // Honor an `fps` override on restart too, so users can tune capture rate
+    // mid-session without restarting the whole daemon.
+    let fps = match cmd.get("fps").and_then(|v| v.as_u64()) {
+        Some(n) => recording::validate_fps(n as u32)?,
+        None => recording::DEFAULT_CAPTURE_FPS,
+    };
+    state.recording_state.fps = fps;
 
     let _ = state.stop_recording_task().await;
 
