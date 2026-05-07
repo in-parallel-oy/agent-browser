@@ -302,13 +302,19 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-For a cursor that's visible in the recording (the OS cursor isn't captured
-by `record start` because frames come from `Page.captureScreenshot`), pass
-`--cursor <theme>` (themes: `arrow`, `dot`, `hand`):
+A synthetic animated cursor is baked into the recording **by default**
+(the OS cursor isn't captured because frames come from
+`Page.captureScreenshot`). Override the theme with `--cursor <theme>`
+(`arrow`, `dot`, `hand`) or disable entirely with `--no-cursor`:
 
 ```bash
-agent-browser record start demo.webm https://example.com --cursor arrow
-# Or tune it:
+# Default cursor (arrow)
+agent-browser record start demo.webm https://example.com
+
+# Disable for a clean recording
+agent-browser record start demo.webm --no-cursor
+
+# Different theme + tuning
 agent-browser record start demo.webm --cursor dot --cursor-tween-ms 350 --cursor-size 36
 ```
 

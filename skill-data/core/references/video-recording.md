@@ -46,29 +46,34 @@ agent-browser record restart ./take2.webm
 ## Cursor Overlay
 
 The OS cursor is never visible in `record start` output (CDP `Page.captureScreenshot`
-renders the page DOM only, with no OS cursor). Pass `--cursor <theme>` to bake an
-in-page synthetic cursor into the recording. The cursor tweens between targets and
+renders the page DOM only, with no OS cursor). The cursor overlay is **on by
+default** with the `arrow` theme; pass `--no-cursor` to disable it, or
+`--cursor <theme>` to override the theme. The cursor tweens between targets and
 pulses on click, captured directly into the WebM frames.
 
 ```bash
-# Default cursor: arrow theme, 250ms tween, 28px size
-agent-browser record start ./demo.webm https://example.com --cursor arrow
+# Default: arrow cursor, 250ms tween, 400ms click ripple, 28px
+agent-browser record start ./demo.webm https://example.com
 
-# Themes: arrow, dot, hand
+# Disable the cursor for a clean recording
+agent-browser record start ./demo.webm --no-cursor
+
+# Pick a different theme
 agent-browser record start ./demo.webm --cursor dot
 
-# Tune the animation
-agent-browser record start ./demo.webm --cursor arrow \
-  --cursor-tween-ms 350 --cursor-click-ms 200 --cursor-size 36
+# Tune the animation (--cursor not required when only tuning)
+agent-browser record start ./demo.webm \
+  --cursor-tween-ms 350 --cursor-click-ms 500 --cursor-size 36
 ```
 
 ### Cursor Flags
 
 | Flag                       | Default | Description                                                |
 |----------------------------|---------|------------------------------------------------------------|
-| `--cursor <theme>`         | (off)   | `arrow`, `dot`, or `hand`. Required to enable the overlay. |
+| `--no-cursor`              | (off)   | Disable the overlay entirely. Cannot be combined with `--cursor`. |
+| `--cursor <theme>`         | `arrow` | `arrow`, `dot`, or `hand`. Override the default theme.     |
 | `--cursor-tween-ms <n>`    | 250     | Duration of the cursor's animated path between targets.    |
-| `--cursor-click-ms <n>`    | 150     | Duration of the click-ripple animation.                    |
+| `--cursor-click-ms <n>`    | 400     | Duration of the click-ripple animation.                    |
 | `--cursor-size <n>`        | 28      | Cursor size in CSS pixels (8-96).                          |
 | `--cursor-motion <mode>`   | auto    | `auto` honors the host's `prefers-reduced-motion`; `always` ignores it; `off` disables tween motion entirely (cursor teleports). |
 | `--cursor-block-clicks`    | off     | Await the tween before each click. Default is fire-and-forget so click latency is unchanged. |

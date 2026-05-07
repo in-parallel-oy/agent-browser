@@ -288,10 +288,11 @@ agent-browser trace start [path]      # Start trace
 agent-browser trace stop [path]       # Stop and save trace
 agent-browser profiler start          # Start Chrome DevTools profiling
 agent-browser profiler stop [path]    # Stop and save profile (.json)
-agent-browser record start <path>     # Start video recording (WebM)
-agent-browser record start <path> [url] --cursor arrow  # Bake an animated cursor into the recording
-agent-browser record stop             # Stop and save video
-agent-browser record restart <path>   # Stop current and start new recording
+agent-browser record start <path>             # Start video recording (WebM); cursor on by default
+agent-browser record start <path> --no-cursor # Record without the cursor overlay
+agent-browser record start <path> --cursor dot # Override cursor theme (arrow|dot|hand)
+agent-browser record stop                     # Stop and save video
+agent-browser record restart <path>           # Stop current and start new recording
 agent-browser console                 # View console messages
 agent-browser console --json          # JSON output with raw CDP args
 agent-browser console --clear         # Clear console log

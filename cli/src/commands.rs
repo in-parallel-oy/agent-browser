@@ -1397,7 +1397,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     let parsed = split_record_args(&rest[1..], "record start")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record start <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
@@ -1422,7 +1422,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     let parsed = split_record_args(&rest[1..], "record restart")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record restart <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
@@ -1719,12 +1719,18 @@ struct RecordArgs<'a> {
 ///
 /// Recognised flags: `--record-fps <n>`; cursor: `--cursor <theme>`,
 /// `--cursor-tween-ms <n>`, `--cursor-click-ms <n>`, `--cursor-size <n>`,
-/// `--cursor-motion <mode>`, `--cursor-block-clicks`. The cursor object is
-/// only emitted when at least one cursor flag was present.
+/// `--cursor-motion <mode>`, `--cursor-block-clicks`, `--no-cursor`.
+///
+/// **Cursor default is ON** with the `arrow` theme. Pass `--no-cursor` to
+/// disable. Tuning flags (`--cursor-tween-ms`, etc.) without `--cursor`
+/// implicitly select the `arrow` theme rather than erroring -- the user
+/// clearly wants the cursor; we just fill in the default theme.
+/// `--cursor` and `--no-cursor` together is a parse error.
 fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArgs<'a>, ParseError> {
     let mut positional: Vec<&str> = Vec::new();
     let mut cursor_obj = serde_json::Map::new();
     let mut cursor_seen = false;
+    let mut no_cursor = false;
     let mut fps: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1750,6 +1756,10 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                 fps = Some(n);
                 i += 2;
             }
+            "--no-cursor" => {
+                no_cursor = true;
+                i += 1;
+            }
             "--cursor" => {
                 let v = args
                     .get(i + 1)
@@ -1772,11 +1782,11 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                     .get(i + 1)
                     .ok_or_else(|| ParseError::MissingArguments {
                         context: format!("{} {}", context, tok),
-                        usage: "record start <output> [url] --cursor <theme> --cursor-* <integer>",
+                        usage: "record start <output> [url] --cursor-* <integer>",
                     })?;
                 let n: u32 = v.parse().map_err(|_| ParseError::InvalidValue {
                     message: format!("{} expects a non-negative integer (got '{}')", tok, v),
-                    usage: "record start <output> [url] --cursor <theme> --cursor-* <integer>",
+                    usage: "record start <output> [url] --cursor-* <integer>",
                 })?;
                 let key = match tok {
                     "--cursor-tween-ms" => "tweenMs",
@@ -1789,17 +1799,19 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                 i += 2;
             }
             "--cursor-motion" => {
-                let v = args.get(i + 1).ok_or_else(|| ParseError::MissingArguments {
-                    context: format!("{} --cursor-motion", context),
-                    usage: "record start <output> [url] --cursor <theme> --cursor-motion <auto|always|off>",
-                })?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --cursor-motion", context),
+                        usage: "record start <output> [url] --cursor-motion <auto|always|off>",
+                    })?;
                 if !matches!(*v, "auto" | "always" | "off") {
                     return Err(ParseError::InvalidValue {
                         message: format!(
                             "--cursor-motion expects one of auto|always|off (got '{}')",
                             v
                         ),
-                        usage: "record start <output> [url] --cursor <theme> --cursor-motion <auto|always|off>",
+                        usage: "record start <output> [url] --cursor-motion <auto|always|off>",
                     });
                 }
                 cursor_obj.insert("motion".to_string(), json!(*v));
@@ -1818,20 +1830,34 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
         }
     }
 
-    // Cursor tuning flags only make sense when --cursor itself is present.
-    // If a user passed --cursor-tween-ms 200 without --cursor, fail loudly
-    // rather than silently dropping the value.
-    if cursor_seen && !cursor_obj.contains_key("theme") {
-        return Err(ParseError::MissingArguments {
-            context: format!("{} (cursor tuning flags without --cursor)", context),
-            usage: "record start <output> [url] --cursor <arrow|dot|hand> [tuning flags]",
+    // --cursor and --no-cursor together is contradictory; fail loudly.
+    if cursor_seen && no_cursor {
+        return Err(ParseError::InvalidValue {
+            message: "--cursor and --no-cursor cannot both be set".to_string(),
+            usage: "record start <output> [url] [--cursor <theme> | --no-cursor]",
         });
     }
 
-    let cursor = if cursor_seen {
+    // Tuning flags without an explicit `--cursor` imply the default theme
+    // (cursor is on by default; the tuning flag confirmed that intent).
+    if cursor_seen && !cursor_obj.contains_key("theme") {
+        cursor_obj.insert("theme".to_string(), json!("arrow"));
+    }
+
+    // Cursor is ON by default. Three states:
+    //   * --no-cursor: emit no cursor object (cursor disabled).
+    //   * any --cursor* flag seen: emit the explicitly-configured object.
+    //   * neither: emit a minimal `{theme: "arrow"}` object so the daemon
+    //     installs the cursor with all other defaults from
+    //     `CursorOverlayConfig::from_cmd_value`.
+    let cursor = if no_cursor {
+        None
+    } else if cursor_seen {
         Some(Value::Object(cursor_obj))
     } else {
-        None
+        let mut default_obj = serde_json::Map::new();
+        default_obj.insert("theme".to_string(), json!("arrow"));
+        Some(Value::Object(default_obj))
     };
     Ok(RecordArgs {
         positional,
@@ -4027,6 +4053,70 @@ mod tests {
         assert_eq!(cmd["action"], "recording_start");
         assert_eq!(cmd["path"], "demo.webm");
         assert_eq!(cmd["url"], "chrome-extension://abcdef/popup.html");
+    }
+
+    #[test]
+    fn test_record_start_default_emits_cursor_arrow() {
+        // Cursor is on by default; bare `record start` should emit a cursor
+        // object with `theme: "arrow"` so the daemon installs the overlay.
+        let cmd = parse_command(&args("record start out.webm"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["cursor"]["theme"], "arrow");
+    }
+
+    #[test]
+    fn test_record_start_no_cursor_opts_out() {
+        let cmd =
+            parse_command(&args("record start out.webm --no-cursor"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert!(cmd.get("cursor").is_none());
+    }
+
+    #[test]
+    fn test_record_start_no_cursor_with_url() {
+        let cmd = parse_command(
+            &args("record start out.webm https://example.com --no-cursor"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["url"], "https://example.com");
+        assert!(cmd.get("cursor").is_none());
+    }
+
+    #[test]
+    fn test_record_start_explicit_cursor_overrides_default() {
+        let cmd = parse_command(
+            &args("record start out.webm --cursor dot"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["cursor"]["theme"], "dot");
+    }
+
+    #[test]
+    fn test_record_start_tuning_flag_implies_default_theme() {
+        // Previously `--cursor-tween-ms 200` without `--cursor` was a parse
+        // error. Now it implies the default theme since cursor is on by
+        // default and the tuning flag confirms intent.
+        let cmd = parse_command(
+            &args("record start out.webm --cursor-tween-ms 200"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["cursor"]["theme"], "arrow");
+        assert_eq!(cmd["cursor"]["tweenMs"], 200);
+    }
+
+    #[test]
+    fn test_record_start_cursor_and_no_cursor_conflict() {
+        let result = parse_command(
+            &args("record start out.webm --cursor arrow --no-cursor"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.format();
+        assert!(msg.contains("--cursor and --no-cursor"));
     }
 
     #[test]

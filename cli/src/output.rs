@@ -2290,39 +2290,44 @@ Operations:
   stop                   Stop recording and save video
   restart <path> [url]   Stop current recording (if any) and start a new one
 
-Cursor Overlay (opt-in; renders a synthetic cursor in the recording):
-  --cursor <theme>           Enable the cursor; theme is arrow|dot|hand
+Cursor Overlay (ON by default; renders a synthetic cursor in the recording):
+  --no-cursor                Disable the cursor entirely
+  --cursor <theme>           Override the theme; arrow (default), dot, or hand
   --cursor-tween-ms <n>      Tween duration between targets, default 250
-  --cursor-click-ms <n>      Click ripple duration, default 150
+  --cursor-click-ms <n>      Click ripple duration, default 400
   --cursor-size <n>          Cursor size in pixels (8-96), default 28
   --cursor-motion <mode>     auto|always|off (auto honors prefers-reduced-motion)
   --cursor-block-clicks      Await tween before clicks for strict visual fidelity
                              (default is fire-and-forget, no added click latency)
 
-Cursor flags only apply when --cursor is set. The cursor overlay is
-recording-only, Chrome-only, and skipped on mobile-emulation viewports.
+The cursor overlay is recording-only, Chrome-only, and skipped on
+mobile-emulation viewports. Tuning flags imply the default `arrow` theme
+when used without `--cursor`. `--cursor` and `--no-cursor` together is
+a parse error.
 
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
 
 Examples:
-  # Record from current page (preserves login state)
+  # Record from current page (preserves login state, cursor included)
   agent-browser open https://app.example.com/dashboard
   agent-browser snapshot -i            # Explore and plan
   agent-browser record start ./demo.webm
   agent-browser click @e3              # Execute planned actions
   agent-browser record stop
 
-  # Or specify a different URL
+  # Specify URL
   agent-browser record start ./demo.webm https://example.com
 
-  # Restart recording with a new file (stops previous, starts new)
-  agent-browser record restart ./take2.webm
+  # Disable the cursor for a clean recording
+  agent-browser record start ./demo.webm --no-cursor
 
-  # Enable the synthetic cursor overlay (visible in the recording)
-  agent-browser record start ./demo.webm https://example.com --cursor arrow
+  # Pick a different theme or tune timings
   agent-browser record start ./demo.webm --cursor dot --cursor-tween-ms 200
+
+  # Restart recording with a new file
+  agent-browser record restart ./take2.webm
 "##
         }
 
@@ -3002,8 +3007,8 @@ Diff:
 Debug:
   trace start|stop [path]    Record Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM); add --cursor <arrow|dot|hand>
-                             to bake an animated cursor into the recording
+  record start <path> [url]  Start video recording (WebM); cursor overlay is ON
+                             by default (pass --no-cursor to disable)
   record stop                Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors
