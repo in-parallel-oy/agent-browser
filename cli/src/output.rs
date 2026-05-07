@@ -2277,9 +2277,9 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url]
+Usage: agent-browser record start <path.webm> [url] [cursor flags]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url]
+       agent-browser record restart <path.webm> [url] [cursor flags]
 
 Record the browser to a WebM video file.
 Creates a fresh browser context but preserves cookies and localStorage.
@@ -2289,6 +2289,18 @@ Operations:
   start <path> [url]     Start recording (defaults to current URL if omitted)
   stop                   Stop recording and save video
   restart <path> [url]   Stop current recording (if any) and start a new one
+
+Cursor Overlay (opt-in; renders a synthetic cursor in the recording):
+  --cursor <theme>           Enable the cursor; theme is arrow|dot|hand
+  --cursor-tween-ms <n>      Tween duration between targets, default 250
+  --cursor-click-ms <n>      Click ripple duration, default 150
+  --cursor-size <n>          Cursor size in pixels (8-96), default 28
+  --cursor-motion <mode>     auto|always|off (auto honors prefers-reduced-motion)
+  --cursor-block-clicks      Await tween before clicks for strict visual fidelity
+                             (default is fire-and-forget, no added click latency)
+
+Cursor flags only apply when --cursor is set. The cursor overlay is
+recording-only, Chrome-only, and skipped on mobile-emulation viewports.
 
 Global Options:
   --json               Output as JSON
@@ -2307,6 +2319,10 @@ Examples:
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm
+
+  # Enable the synthetic cursor overlay (visible in the recording)
+  agent-browser record start ./demo.webm https://example.com --cursor arrow
+  agent-browser record start ./demo.webm --cursor dot --cursor-tween-ms 200
 "##
         }
 
@@ -2986,7 +3002,8 @@ Diff:
 Debug:
   trace start|stop [path]    Record Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM)
+  record start <path> [url]  Start video recording (WebM); add --cursor <arrow|dot|hand>
+                             to bake an animated cursor into the recording
   record stop                Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors

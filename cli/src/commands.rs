@@ -1394,15 +1394,14 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             const VALID: &[&str] = &["start", "stop", "restart"];
             match rest.first().copied() {
                 Some("start") => {
-                    let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                    let (positional, cursor) = split_record_args(&rest[1..], "record start")?;
+                    let path = positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url]",
+                        usage: "record start <output.webm> [url] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
-                    // Optional URL parameter
-                    let url = rest.get(2);
+                    let url = positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
                     if let Some(u) = url {
-                        // Add https:// prefix if needed (preserve special schemes)
                         let url_str = if u.starts_with("http") || u.contains("://") {
                             u.to_string()
                         } else {
@@ -1410,25 +1409,30 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                         };
                         cmd["url"] = json!(url_str);
                     }
+                    if let Some(c) = cursor {
+                        cmd["cursor"] = c;
+                    }
                     Ok(cmd)
                 }
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => {
-                    let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                    let (positional, cursor) = split_record_args(&rest[1..], "record restart")?;
+                    let path = positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url]",
+                        usage: "record restart <output.webm> [url] [--cursor <arrow|dot|hand>] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
-                    // Optional URL parameter
-                    let url = rest.get(2);
+                    let url = positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
                     if let Some(u) = url {
-                        // Add https:// prefix if needed (preserve special schemes)
                         let url_str = if u.starts_with("http") || u.contains("://") {
                             u.to_string()
                         } else {
                             format!("https://{}", u)
                         };
                         cmd["url"] = json!(url_str);
+                    }
+                    if let Some(c) = cursor {
+                        cmd["cursor"] = c;
                     }
                     Ok(cmd)
                 }
@@ -1694,6 +1698,111 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             command: cmd.to_string(),
         }),
     }
+}
+
+/// Split a `record start`/`record restart` argument list into positional
+/// args (path, optional url) and an optional `cursor` JSON object.
+///
+/// Recognised cursor flags: `--cursor <theme>`, `--cursor-tween-ms <n>`,
+/// `--cursor-click-ms <n>`, `--cursor-size <n>`, `--cursor-motion <mode>`,
+/// `--cursor-block-clicks`. The first three pull a value from the next
+/// token; the last is a bare boolean. The cursor object is only emitted
+/// when at least one cursor flag was present.
+fn split_record_args<'a>(
+    args: &'a [&'a str],
+    context: &str,
+) -> Result<(Vec<&'a str>, Option<Value>), ParseError> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut cursor_obj = serde_json::Map::new();
+    let mut cursor_seen = false;
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i];
+        match tok {
+            "--cursor" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --cursor", context),
+                        usage: "record start <output> [url] --cursor <arrow|dot|hand>",
+                    })?;
+                if !matches!(*v, "arrow" | "dot" | "hand") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--cursor expects one of arrow|dot|hand (got '{}')", v),
+                        usage: "record start <output> [url] --cursor <arrow|dot|hand>",
+                    });
+                }
+                cursor_obj.insert("theme".to_string(), json!(*v));
+                cursor_seen = true;
+                i += 2;
+            }
+            "--cursor-tween-ms" | "--cursor-click-ms" | "--cursor-size" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} {}", context, tok),
+                        usage: "record start <output> [url] --cursor <theme> --cursor-* <integer>",
+                    })?;
+                let n: u32 = v.parse().map_err(|_| ParseError::InvalidValue {
+                    message: format!("{} expects a non-negative integer (got '{}')", tok, v),
+                    usage: "record start <output> [url] --cursor <theme> --cursor-* <integer>",
+                })?;
+                let key = match tok {
+                    "--cursor-tween-ms" => "tweenMs",
+                    "--cursor-click-ms" => "clickMs",
+                    "--cursor-size" => "size",
+                    _ => unreachable!(),
+                };
+                cursor_obj.insert(key.to_string(), json!(n));
+                cursor_seen = true;
+                i += 2;
+            }
+            "--cursor-motion" => {
+                let v = args.get(i + 1).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --cursor-motion", context),
+                    usage: "record start <output> [url] --cursor <theme> --cursor-motion <auto|always|off>",
+                })?;
+                if !matches!(*v, "auto" | "always" | "off") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "--cursor-motion expects one of auto|always|off (got '{}')",
+                            v
+                        ),
+                        usage: "record start <output> [url] --cursor <theme> --cursor-motion <auto|always|off>",
+                    });
+                }
+                cursor_obj.insert("motion".to_string(), json!(*v));
+                cursor_seen = true;
+                i += 2;
+            }
+            "--cursor-block-clicks" => {
+                cursor_obj.insert("blockClicks".to_string(), json!(true));
+                cursor_seen = true;
+                i += 1;
+            }
+            _ => {
+                positional.push(tok);
+                i += 1;
+            }
+        }
+    }
+
+    // Cursor tuning flags only make sense when --cursor itself is present.
+    // If a user passed --cursor-tween-ms 200 without --cursor, fail loudly
+    // rather than silently dropping the value.
+    if cursor_seen && !cursor_obj.contains_key("theme") {
+        return Err(ParseError::MissingArguments {
+            context: format!("{} (cursor tuning flags without --cursor)", context),
+            usage: "record start <output> [url] --cursor <arrow|dot|hand> [tuning flags]",
+        });
+    }
+
+    let cursor = if cursor_seen {
+        Some(Value::Object(cursor_obj))
+    } else {
+        None
+    };
+    Ok((positional, cursor))
 }
 
 fn parse_react(rest: &[&str], id: &str) -> Result<Value, ParseError> {

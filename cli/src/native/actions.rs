@@ -260,6 +260,12 @@ pub struct DaemonState {
     /// Last viewport settings (width, height, deviceScaleFactor, mobile),
     /// re-applied to new contexts (e.g., recording).
     pub viewport: Option<(i32, i32, f64, bool)>,
+    /// Cursor overlay configuration for the active recording, if any. `None`
+    /// when no recording is active or `--cursor` was not passed.
+    pub cursor_overlay: Option<super::cursor_overlay::CursorOverlayConfig>,
+    /// Identifier returned by `Page.addScriptToEvaluateOnNewDocument` when
+    /// the cursor overlay is installed. Cleared by `record stop`/`restart`.
+    pub cursor_script_id: Option<String>,
 }
 
 impl DaemonState {
@@ -314,7 +320,19 @@ impl DaemonState {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30_000),
             viewport: None,
+            cursor_overlay: None,
+            cursor_script_id: None,
         }
+    }
+
+    /// Build a copyable bridge view of the active cursor configuration, but
+    /// only if the cursor overlay is currently installed on a recording
+    /// session. Returns `None` otherwise -- the click/hover hooks then skip
+    /// every cursor-related call entirely (zero-cost for non-recording
+    /// sessions).
+    pub fn cursor_bridge(&self) -> Option<super::cursor_overlay::CursorBridge> {
+        self.cursor_script_id.as_ref()?;
+        self.cursor_overlay.as_ref().map(|c| c.bridge())
     }
 
     /// Extract the timeout from a command JSON, falling back to the
@@ -2671,14 +2689,14 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
+    let cursor = state.cursor_bridge();
     interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
-        button,
-        click_count,
         &state.iframe_sessions,
+        interaction::ClickOptions::new(button, click_count, cursor.as_ref()),
     )
     .await?;
 
@@ -2693,12 +2711,14 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor = state.cursor_bridge();
     interaction::dblclick(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
+        cursor.as_ref(),
     )
     .await?;
     Ok(json!({ "clicked": selector }))
@@ -2827,12 +2847,14 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor = state.cursor_bridge();
     interaction::hover(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
+        cursor.as_ref(),
     )
     .await?;
     Ok(json!({ "hovered": selector }))
@@ -2913,12 +2935,14 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor = state.cursor_bridge();
     interaction::check(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
+        cursor.as_ref(),
     )
     .await?;
     Ok(json!({ "checked": selector }))
@@ -2932,12 +2956,14 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor = state.cursor_bridge();
     interaction::uncheck(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
+        cursor.as_ref(),
     )
     .await?;
     Ok(json!({ "unchecked": selector }))
@@ -3881,14 +3907,14 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let mut rx = mgr.client.subscribe();
 
     // Click the element to trigger the download
+    let cursor = state.cursor_bridge();
     interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
-        "left",
-        1,
         &state.iframe_sessions,
+        interaction::ClickOptions::new("left", 1, cursor.as_ref()),
     )
     .await?;
 
@@ -4039,6 +4065,14 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 
     let viewport = state.viewport;
 
+    // Parse optional cursor overlay config. Absence = cursor disabled. Errors
+    // here surface to the user before the recording context is created so a
+    // typo'd `--cursor` value doesn't silently produce a cursor-less video.
+    let cursor_config = match cmd.get("cursor") {
+        Some(v) => super::cursor_overlay::CursorOverlayConfig::from_cmd_value(v)?,
+        None => None,
+    };
+
     let (client, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         let old_session_id = mgr.active_session_id()?.to_string();
@@ -4175,6 +4209,35 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         (mgr.client.clone(), new_session_id)
     };
 
+    // Install the cursor overlay (if requested) on the new recording session,
+    // before the capture task starts piping frames. Skip on non-Chrome engines
+    // and on mobile-emulation viewports per the plan; failures here are
+    // logged and the recording continues without a cursor (graceful
+    // degradation -- the rest of the recording is still useful).
+    state.cursor_overlay = None;
+    state.cursor_script_id = None;
+    if let Some(cfg) = cursor_config {
+        let is_mobile = state.viewport.map(|(_, _, _, m)| m).unwrap_or(false);
+        if state.engine != "chrome" {
+            eprintln!(
+                "agent-browser: cursor overlay disabled (engine={}); only Chrome is supported in v1",
+                state.engine
+            );
+        } else if is_mobile {
+            eprintln!("agent-browser: cursor overlay disabled (mobile viewport)");
+        } else {
+            match super::cursor_overlay::install(&client, &new_session_id, &cfg).await {
+                Ok(id) => {
+                    state.cursor_overlay = Some(cfg);
+                    state.cursor_script_id = Some(id);
+                }
+                Err(e) => {
+                    eprintln!("agent-browser: cursor overlay install failed: {}", e);
+                }
+            }
+        }
+    }
+
     let result = recording::recording_start(&mut state.recording_state, path)?;
     state.start_recording_task(client, new_session_id).await?;
 
@@ -4188,6 +4251,23 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String> {
     state.stop_recording_task().await?;
     let result = recording::recording_stop(&mut state.recording_state);
+
+    // Tear down the cursor overlay, if any. Best-effort: a remove failure
+    // (e.g., page already closed) is logged and the script id is cleared
+    // either way so a subsequent record-start gets a clean slate.
+    if let Some(id) = state.cursor_script_id.take() {
+        if let Some(ref browser) = state.browser {
+            if let Ok(session_id) = browser.active_session_id() {
+                let session_id = session_id.to_string();
+                if let Err(e) =
+                    super::cursor_overlay::remove(&browser.client, &session_id, &id).await
+                {
+                    eprintln!("agent-browser: cursor overlay remove failed: {}", e);
+                }
+            }
+        }
+    }
+    state.cursor_overlay = None;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(false, &state.engine).await;
@@ -4203,13 +4283,47 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         .ok_or("Missing 'path' parameter")?;
 
     let _ = state.stop_recording_task().await;
+
+    // `record restart` re-uses the same browser session, so the previous
+    // overlay script registration (and DOM host) is still alive. Remove
+    // before the new recording_restart kicks the capture task -- otherwise
+    // a re-install would double-mount and a second cursor would appear.
+    if let Some(id) = state.cursor_script_id.take() {
+        if let Some(ref browser) = state.browser {
+            if let Ok(session_id) = browser.active_session_id() {
+                let session_id = session_id.to_string();
+                let _ = super::cursor_overlay::remove(&browser.client, &session_id, &id).await;
+            }
+        }
+    }
+    let prior_cursor_cfg = state.cursor_overlay.take();
+
     let result = recording::recording_restart(&mut state.recording_state, path)?;
 
     if let Some(ref browser) = state.browser {
         let session_id = browser.active_session_id()?.to_string();
-        state
-            .start_recording_task(browser.client.clone(), session_id)
-            .await?;
+        let client = browser.client.clone();
+
+        // Re-install the cursor overlay on the same session if one was active
+        // before the restart. Failures are logged and the recording
+        // continues without a cursor (same graceful-degradation posture as
+        // record start).
+        if let Some(cfg) = prior_cursor_cfg {
+            match super::cursor_overlay::install(&client, &session_id, &cfg).await {
+                Ok(id) => {
+                    state.cursor_overlay = Some(cfg);
+                    state.cursor_script_id = Some(id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "agent-browser: cursor overlay re-install on restart failed: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        state.start_recording_task(client, session_id).await?;
     }
 
     Ok(result)
@@ -5613,6 +5727,7 @@ async fn execute_subaction(
         .unwrap_or("click");
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let cursor = state.cursor_bridge();
 
     match subaction {
         "click" => {
@@ -5621,9 +5736,8 @@ async fn execute_subaction(
                 &session_id,
                 &state.ref_map,
                 selector,
-                "left",
-                1,
                 &state.iframe_sessions,
+                interaction::ClickOptions::new("left", 1, cursor.as_ref()),
             )
             .await?;
             Ok(json!({ "clicked": selector }))
@@ -5651,6 +5765,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
+                cursor.as_ref(),
             )
             .await?;
             Ok(json!({ "checked": selector }))
@@ -5662,6 +5777,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
+                cursor.as_ref(),
             )
             .await?;
             Ok(json!({ "hovered": selector }))
@@ -7440,6 +7556,10 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
     let username = cred.username;
     let password = cred.password;
 
+    // Capture cursor bridge before the mutable borrow on `state.browser` --
+    // both `mgr` (mutable) and `state.cursor_bridge()` (immutable) would
+    // otherwise conflict.
+    let cursor = state.cursor_bridge();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     mgr.navigate(&url, AUTH_LOGIN_WAIT_UNTIL).await?;
 
@@ -7591,9 +7711,8 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &session_id,
         &state.ref_map,
         &sub_sel,
-        "left",
-        1,
         &state.iframe_sessions,
+        interaction::ClickOptions::new("left", 1, cursor.as_ref()),
     )
     .await?;
 

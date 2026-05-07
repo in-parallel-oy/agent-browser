@@ -28,7 +28,7 @@ pub mod scripts;
 // stripping them now would just churn the diff when PR 2 reintroduces them.
 #[allow(unused_imports)]
 pub use controller::{
-    click_pulse, install, move_async, move_blocking, remove, CursorOverlayConfig,
+    click_pulse, install, move_async, move_blocking, remove, CursorBridge, CursorOverlayConfig,
 };
 #[allow(unused_imports)]
 pub use scripts::{build_install_script, MotionMode, Theme};

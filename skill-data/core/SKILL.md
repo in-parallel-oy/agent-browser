@@ -294,8 +294,18 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-See [references/video-recording.md](references/video-recording.md) for
-codec options, GIF export, and more.
+For a cursor that's visible in the recording (the OS cursor isn't captured
+by `record start` because frames come from `Page.captureScreenshot`), pass
+`--cursor <theme>` (themes: `arrow`, `dot`, `hand`):
+
+```bash
+agent-browser record start demo.webm https://example.com --cursor arrow
+# Or tune it:
+agent-browser record start demo.webm --cursor dot --cursor-tween-ms 350 --cursor-size 36
+```
+
+See [references/video-recording.md](references/video-recording.md) for the
+full cursor flag set, sync-model trade-offs, and other recording options.
 
 ### Iframes
 

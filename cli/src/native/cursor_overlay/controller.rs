@@ -58,6 +58,88 @@ impl CursorOverlayConfig {
             self.motion,
         )
     }
+
+    /// Snapshot of the per-call knobs the click/hover hooks need. Held by
+    /// reference so the click pipeline doesn't repeatedly clone the full
+    /// config.
+    pub fn bridge(&self) -> CursorBridge {
+        CursorBridge {
+            tween_ms: self.tween_ms,
+            block_clicks: self.block_clicks,
+        }
+    }
+
+    /// Parse the `cursor` object the CLI parser emits on `recording_start` /
+    /// `recording_restart`. Returns `Ok(None)` when the field is absent --
+    /// callers treat absence as "cursor disabled." Numeric inputs are
+    /// validated against the same bounds the CLI advertises so a stray API
+    /// call can't blow past them.
+    pub fn from_cmd_value(value: &Value) -> Result<Option<Self>, String> {
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => return Err("'cursor' must be an object".to_string()),
+        };
+
+        let theme_str = obj.get("theme").and_then(|v| v.as_str()).unwrap_or("arrow");
+        let theme = Theme::from_str_ci(theme_str)?;
+
+        let motion_str = obj.get("motion").and_then(|v| v.as_str()).unwrap_or("auto");
+        let motion = MotionMode::from_str_ci(motion_str)?;
+
+        let size_px = bounded_u32(obj.get("size"), "size", 8, 96, 28)?;
+        let tween_ms = bounded_u32(obj.get("tweenMs"), "tweenMs", 0, 2000, 250)?;
+        let click_ms = bounded_u32(obj.get("clickMs"), "clickMs", 0, 2000, 150)?;
+        let block_clicks = obj
+            .get("blockClicks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(Some(Self {
+            theme,
+            size_px,
+            tween_ms,
+            click_ms,
+            motion,
+            block_clicks,
+        }))
+    }
+}
+
+fn bounded_u32(
+    value: Option<&Value>,
+    name: &str,
+    lo: u32,
+    hi: u32,
+    default: u32,
+) -> Result<u32, String> {
+    let v = match value {
+        Some(v) => v,
+        None => return Ok(default),
+    };
+    let n = v
+        .as_u64()
+        .ok_or_else(|| format!("cursor.{} must be a non-negative integer", name))?;
+    if n > u32::MAX as u64 {
+        return Err(format!("cursor.{} is out of range", name));
+    }
+    let n = n as u32;
+    if n < lo || n > hi {
+        return Err(format!(
+            "cursor.{} must be between {} and {} (got {})",
+            name, lo, hi, n
+        ));
+    }
+    Ok(n)
+}
+
+/// Lightweight, copyable view of the cursor settings the click/hover hooks
+/// in `interaction.rs` need. Assembled by `actions.rs` only when a recording
+/// is active and the cursor is installed; passed as `Option<&CursorBridge>`
+/// to keep the no-cursor call path zero-cost.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorBridge {
+    pub tween_ms: u32,
+    pub block_clicks: bool,
 }
 
 /// Install the cursor overlay on the given CDP session.

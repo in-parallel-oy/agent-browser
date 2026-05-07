@@ -8,6 +8,7 @@ Capture browser automation as video for debugging, documentation, or verificatio
 
 - [Basic Recording](#basic-recording)
 - [Recording Commands](#recording-commands)
+- [Cursor Overlay](#cursor-overlay)
 - [Use Cases](#use-cases)
 - [Best Practices](#best-practices)
 - [Output Format](#output-format)
@@ -41,6 +42,57 @@ agent-browser record stop
 # Restart with new file (stops current + starts new)
 agent-browser record restart ./take2.webm
 ```
+
+## Cursor Overlay
+
+The OS cursor is never visible in `record start` output (CDP `Page.captureScreenshot`
+renders the page DOM only, with no OS cursor). Pass `--cursor <theme>` to bake an
+in-page synthetic cursor into the recording. The cursor tweens between targets and
+pulses on click, captured directly into the WebM frames.
+
+```bash
+# Default cursor: arrow theme, 250ms tween, 28px size
+agent-browser record start ./demo.webm https://example.com --cursor arrow
+
+# Themes: arrow, dot, hand
+agent-browser record start ./demo.webm --cursor dot
+
+# Tune the animation
+agent-browser record start ./demo.webm --cursor arrow \
+  --cursor-tween-ms 350 --cursor-click-ms 200 --cursor-size 36
+```
+
+### Cursor Flags
+
+| Flag                       | Default | Description                                                |
+|----------------------------|---------|------------------------------------------------------------|
+| `--cursor <theme>`         | (off)   | `arrow`, `dot`, or `hand`. Required to enable the overlay. |
+| `--cursor-tween-ms <n>`    | 250     | Duration of the cursor's animated path between targets.    |
+| `--cursor-click-ms <n>`    | 150     | Duration of the click-ripple animation.                    |
+| `--cursor-size <n>`        | 28      | Cursor size in CSS pixels (8-96).                          |
+| `--cursor-motion <mode>`   | auto    | `auto` honors the host's `prefers-reduced-motion`; `always` ignores it; `off` disables tween motion entirely (cursor teleports). |
+| `--cursor-block-clicks`    | off     | Await the tween before each click. Default is fire-and-forget so click latency is unchanged. |
+
+### Sync Model
+
+By default the tween fires in parallel with the click (no added click latency).
+At 10 fps capture, even a 250 ms tween shows up across 2-3 frames — visually
+the cursor "flies in" and lands as the click registers. When strict visual
+fidelity matters more than click timing, pass `--cursor-block-clicks` to await
+the tween.
+
+### Limits
+
+- **Recording-only.** The dashboard live screencast is unchanged.
+- **Chrome only.** `lightpanda` and other engines skip cursor install with an
+  info-level log; the recording proceeds without a cursor.
+- **Top-frame only.** Click coordinates inside iframes are correct, but the
+  visual cursor is rendered in the top frame.
+- **Skipped on mobile-emulation viewports** (touch input does not benefit from
+  a synthetic cursor).
+- **`record restart` re-uses the same browser session.** The previous cursor
+  is removed before re-installing so a second cursor cannot accidentally
+  appear.
 
 ## Use Cases
 
