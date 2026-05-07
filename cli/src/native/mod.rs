@@ -9,6 +9,8 @@ pub mod cdp;
 #[allow(dead_code)]
 pub mod cookies;
 #[allow(dead_code)]
+pub mod cursor_overlay;
+#[allow(dead_code)]
 pub mod daemon;
 #[allow(dead_code)]
 pub mod diff;
