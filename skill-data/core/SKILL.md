@@ -29,6 +29,14 @@ Refs (`@e1`, `@e2`, ...) are assigned fresh on every snapshot. They become
 submits, dynamic re-renders, dialog opens. Always re-snapshot before your
 next ref interaction.
 
+The ref map is cleared by `open`, `navigate`, `back`, `forward`, `reload`,
+`tab new`/`switch`/`close`, `window new`, `close`, `screenshot --annotate`,
+and any `click` that triggers navigation. Stale-ref errors point at
+which command did the clearing — e.g. `Unknown ref: e1 (ref_map was
+cleared by \`back\`; run \`snapshot\` to repopulate)`. See
+[references/snapshot-refs.md](references/snapshot-refs.md) for the full
+list and recovery patterns.
+
 ## Quickstart
 
 ```bash

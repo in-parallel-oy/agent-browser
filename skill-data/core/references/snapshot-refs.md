@@ -95,6 +95,31 @@ agent-browser snapshot -i
 # @e1 [h1] "Page 2"  ← Different element now!
 ```
 
+### What invalidates refs
+
+The ref map is cleared on every command that can change which DOM is in
+view. Run `snapshot` again before using `@eN` after any of these:
+
+- `open` / `navigate` (any URL change)
+- `back`, `forward`, `reload`
+- `tab new`, `tab switch`, `tab close`
+- `window new`
+- `close` (and any `launch` that re-creates the browser)
+- `click --new-tab`, or any `click` that triggers navigation
+- `screenshot --annotate` (rebuilds refs as part of the annotation)
+- `diff url` (snapshots the second URL into the same ref map)
+
+When this rule is violated, the resolver returns:
+
+```text
+Unknown ref: e5 (ref_map was cleared by `back`; run `snapshot` to repopulate)
+```
+
+The reason in backticks comes from whichever command did the clearing.
+If you see this error in a recording demo, the most common cause is a
+shell that suppressed stderr — turn off `2>/dev/null` and the failure
+becomes loud.
+
 ## Best Practices
 
 ### 1. Always Snapshot Before Interacting

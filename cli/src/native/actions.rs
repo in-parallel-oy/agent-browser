@@ -1788,7 +1788,9 @@ async fn rollback_failed_launch(state: &mut DaemonState) -> Result<(), String> {
     state.launch_hash = None;
     state.screencasting = false;
     state.reset_input_state();
-    state.ref_map.clear();
+    state
+        .ref_map
+        .clear_with_reason(Some("browser launch rolled back"));
     state.update_stream_client().await;
 
     if let Some(err) = close_error {
@@ -1947,7 +1949,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         load_storage_state(state, &storage_state_owned).await?;
         return Ok(json!({ "launched": true, "reused": true }));
     }
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("browser relaunched"));
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -2239,7 +2241,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     // WebDriver backend path
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            state.ref_map.clear();
+            state.ref_map.clear_with_reason(Some("navigate"));
             wb.navigate(url).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
@@ -2297,7 +2299,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("navigate"));
     state.iframe_sessions.clear();
     state.active_frame_id = None;
     mgr.navigate(url, wait_until).await
@@ -2461,7 +2463,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
         server.shutdown();
     }
 
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("browser closed"));
     Ok(json!({ "closed": true }))
 }
 
@@ -2493,7 +2495,11 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
     };
 
-    state.ref_map.clear();
+    // Reason here is informational only -- `take_snapshot` calls `add_*`
+    // methods on the way back up, which reset `last_clear_reason` to None.
+    // If the snapshot fails partway through, the reason ("snapshot rebuild")
+    // is what surfaces on subsequent unknown-ref errors.
+    state.ref_map.clear_with_reason(Some("snapshot rebuild"));
     let tree = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
@@ -2596,7 +2602,9 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     };
 
     if annotate {
-        state.ref_map.clear();
+        state
+            .ref_map
+            .clear_with_reason(Some("screenshot --annotate rebuild"));
         let _ = snapshot::take_snapshot(
             &mgr.client,
             &session_id,
@@ -2683,7 +2691,9 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             .to_string();
 
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        state.ref_map.clear();
+        state
+            .ref_map
+            .clear_with_reason(Some("click opened new tab"));
         mgr.tab_new(Some(&href), None).await?;
 
         return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
@@ -3124,7 +3134,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
             wb.back().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.clear_with_reason(Some("back"));
             return Ok(json!({ "url": url }));
         }
     }
@@ -3132,7 +3142,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
     mgr.evaluate("history.back()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("back"));
     Ok(json!({ "url": url }))
 }
 
@@ -3142,7 +3152,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
             wb.forward().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.clear_with_reason(Some("forward"));
             return Ok(json!({ "url": url }));
         }
     }
@@ -3150,7 +3160,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
     mgr.evaluate("history.forward()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("forward"));
     Ok(json!({ "url": url }))
 }
 
@@ -3160,7 +3170,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
             wb.reload().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.ref_map.clear_with_reason(Some("reload"));
             return Ok(json!({ "url": url }));
         }
     }
@@ -3190,7 +3200,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
     .await;
 
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("reload"));
     Ok(json!({ "url": url }))
 }
 
@@ -3575,7 +3585,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     // Navigate to URL2 and snapshot
     mgr.navigate(url2, wait_until).await?;
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("diff url"));
     let snap2 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
@@ -3742,7 +3752,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     let url = cmd.get("url").and_then(|v| v.as_str());
     let label = cmd.get("label").and_then(|v| v.as_str());
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("tab new"));
     state.iframe_sessions.clear();
     state.active_frame_id = None;
     mgr.tab_new(url, label).await
@@ -3756,7 +3766,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .ok_or("Missing 'tabId' parameter (expected `t<N>` or a label)")?;
     let tab_ref = super::browser::TabRef::parse(tab_ref_str)?;
     let tab_id = mgr.resolve_tab_ref(&tab_ref)?;
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("tab switch"));
     state.iframe_sessions.clear();
     state.active_frame_id = None;
     let result = mgr.tab_switch_by_id(tab_id).await?;
@@ -3791,7 +3801,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         }
         None => None,
     };
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("tab close"));
     state.iframe_sessions.clear();
     state.active_frame_id = None;
     mgr.tab_close_by_id(tab_id).await
@@ -6497,7 +6507,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
     }
 
     let total = mgr.page_count();
-    state.ref_map.clear();
+    state.ref_map.clear_with_reason(Some("window new"));
 
     Ok(json!({
         "tabId": super::browser::format_tab_id(tab_id),

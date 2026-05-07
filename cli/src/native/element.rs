@@ -18,6 +18,14 @@ pub struct RefEntry {
 pub struct RefMap {
     map: HashMap<String, RefEntry>,
     next_ref: usize,
+    /// Last user-facing reason the map was cleared. Set by
+    /// `clear_with_reason`, surfaced in "Unknown ref" errors so agents and
+    /// humans can tell *why* their `@eN` reference vanished. Reset to
+    /// `None` whenever a fresh entry is added (i.e., after a successful
+    /// snapshot), since at that point the previous clear has been "healed"
+    /// and a subsequent unknown-ref error is about a never-existed id, not
+    /// about the navigation that wiped the map.
+    last_clear_reason: Option<&'static str>,
 }
 
 impl RefMap {
@@ -25,6 +33,7 @@ impl RefMap {
         Self {
             map: HashMap::new(),
             next_ref: 1,
+            last_clear_reason: None,
         }
     }
 
@@ -59,6 +68,10 @@ impl RefMap {
                 frame_id: frame_id.map(|s| s.to_string()),
             },
         );
+        // A successful add means the post-clear refill has produced refs;
+        // any "Unknown ref" error from this point on is about a missing id,
+        // not about the prior nav that cleared the map.
+        self.last_clear_reason = None;
     }
 
     pub fn add_selector(
@@ -80,6 +93,7 @@ impl RefMap {
                 frame_id: None,
             },
         );
+        self.last_clear_reason = None;
     }
 
     pub fn get(&self, ref_id: &str) -> Option<&RefEntry> {
@@ -108,8 +122,21 @@ impl RefMap {
     }
 
     pub fn clear(&mut self) {
+        self.clear_with_reason(None);
+    }
+
+    /// Clear the map and record a short reason ("back", "navigate",
+    /// "tab_switch", ...) that gets surfaced in "Unknown ref" errors. The
+    /// reason auto-resets the next time `add`/`add_with_frame`/`add_selector`
+    /// runs, so a clear-then-snapshot cycle leaves no stale reason behind.
+    pub fn clear_with_reason(&mut self, reason: Option<&'static str>) {
         self.map.clear();
         self.next_ref = 1;
+        self.last_clear_reason = reason;
+    }
+
+    pub fn last_clear_reason(&self) -> Option<&'static str> {
+        self.last_clear_reason
     }
 
     pub fn next_ref_num(&self) -> usize {
@@ -146,6 +173,23 @@ pub fn parse_ref(input: &str) -> Option<String> {
     None
 }
 
+/// Format the "Unknown ref" error with a hint pointing at the most recent
+/// reason `ref_map` was cleared, when one is recorded. Without the hint
+/// agents and humans see only `"Unknown ref: e1"` and have to guess
+/// whether it never existed or got wiped by a recent navigation.
+fn unknown_ref_error(ref_id: &str, ref_map: &RefMap) -> String {
+    match ref_map.last_clear_reason() {
+        Some(reason) => format!(
+            "Unknown ref: {} (ref_map was cleared by `{}`; run `snapshot` to repopulate)",
+            ref_id, reason
+        ),
+        None => format!(
+            "Unknown ref: {} (run `snapshot` to populate ref_map)",
+            ref_id
+        ),
+    }
+}
+
 pub async fn resolve_element_center(
     client: &CdpClient,
     session_id: &str,
@@ -156,7 +200,7 @@ pub async fn resolve_element_center(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| unknown_ref_error(&ref_id, ref_map))?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
@@ -223,7 +267,7 @@ pub async fn resolve_element_object_id(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| unknown_ref_error(&ref_id, ref_map))?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
@@ -1015,6 +1059,50 @@ mod tests {
         assert!(map.get("e1").is_some());
         assert_eq!(map.get("e1").unwrap().role, "button");
         assert!(map.get("e2").is_none());
+    }
+
+    #[test]
+    fn test_clear_with_reason_records_and_unknown_ref_surfaces_it() {
+        let mut map = RefMap::new();
+        map.add("e1".to_string(), Some(42), "button", "Submit", None);
+        // Plain `clear()` records no reason; the error mentions snapshotting
+        // but doesn't blame any specific command.
+        map.clear();
+        assert!(map.last_clear_reason().is_none());
+        let msg = unknown_ref_error("e5", &map);
+        assert!(msg.contains("Unknown ref: e5"));
+        assert!(msg.contains("snapshot"));
+        assert!(!msg.contains("cleared by"));
+
+        // `clear_with_reason` records the cause; the error blames it.
+        map.clear_with_reason(Some("back"));
+        assert_eq!(map.last_clear_reason(), Some("back"));
+        let msg = unknown_ref_error("e1", &map);
+        assert!(msg.contains("Unknown ref: e1"));
+        assert!(msg.contains("cleared by `back`"));
+        assert!(msg.contains("snapshot"));
+    }
+
+    #[test]
+    fn test_add_resets_last_clear_reason() {
+        // After a clear-with-reason, the next add (e.g., from a fresh
+        // snapshot) heals the prior nav: subsequent unknown-ref errors
+        // shouldn't keep blaming the old `back` that's already been
+        // recovered from.
+        let mut map = RefMap::new();
+        map.clear_with_reason(Some("back"));
+        assert_eq!(map.last_clear_reason(), Some("back"));
+        map.add("e1".to_string(), Some(1), "link", "Home", None);
+        assert!(map.last_clear_reason().is_none());
+
+        // add_selector and add_with_frame must reset the reason too.
+        map.clear_with_reason(Some("navigate"));
+        map.add_with_frame("e2".to_string(), Some(2), "button", "Go", None, None);
+        assert!(map.last_clear_reason().is_none());
+
+        map.clear_with_reason(Some("reload"));
+        map.add_selector("e3".to_string(), "#x".to_string(), "input", "", None);
+        assert!(map.last_clear_reason().is_none());
     }
 
     #[test]
