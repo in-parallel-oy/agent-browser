@@ -17,11 +17,11 @@ Capture browser automation as video for debugging, documentation, or verificatio
 ## Basic Recording
 
 ```bash
-# Start recording
+# Launch the browser, then start recording
+agent-browser open https://example.com
 agent-browser record start ./demo.webm
 
 # Perform actions
-agent-browser open https://example.com
 agent-browser snapshot -i
 agent-browser click @e1
 agent-browser fill @e2 "test input"
@@ -33,6 +33,9 @@ agent-browser record stop
 ## Recording Commands
 
 ```bash
+# Launch a session first
+agent-browser open
+
 # Start recording to file
 agent-browser record start ./output.webm
 
@@ -107,10 +110,9 @@ the tween.
 #!/bin/bash
 # Record automation for debugging
 
-agent-browser record start ./debug-$(date +%Y%m%d-%H%M%S).webm
-
 # Run your automation
 agent-browser open https://app.example.com
+agent-browser record start ./debug-$(date +%Y%m%d-%H%M%S).webm
 agent-browser snapshot -i
 agent-browser click @e1 || {
     echo "Click failed - check recording"
@@ -127,9 +129,8 @@ agent-browser record stop
 #!/bin/bash
 # Record workflow for documentation
 
-agent-browser record start ./docs/how-to-login.webm
-
 agent-browser open https://app.example.com/login
+agent-browser record start ./docs/how-to-login.webm
 agent-browser wait 1000  # Pause for visibility
 
 agent-browser snapshot -i
@@ -156,6 +157,7 @@ TEST_NAME="${1:-e2e-test}"
 RECORDING_DIR="./test-recordings"
 mkdir -p "$RECORDING_DIR"
 
+agent-browser open
 agent-browser record start "$RECORDING_DIR/$TEST_NAME-$(date +%s).webm"
 
 # Run test
@@ -198,6 +200,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+agent-browser open
 agent-browser record start ./automation.webm
 # ... automation steps ...
 ```
@@ -206,9 +209,8 @@ agent-browser record start ./automation.webm
 
 ```bash
 # Record video AND capture key frames
-agent-browser record start ./flow.webm
-
 agent-browser open https://example.com
+agent-browser record start ./flow.webm
 agent-browser screenshot ./screenshots/step1-homepage.png
 
 agent-browser click @e1

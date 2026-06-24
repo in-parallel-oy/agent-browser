@@ -5,8 +5,10 @@ mod connection;
 mod doctor;
 mod flags;
 mod install;
+mod mcp;
 mod native;
 mod output;
+mod plugins;
 mod skills;
 #[cfg(test)]
 mod test_utils;
@@ -25,8 +27,8 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 
 use commands::{gen_id, parse_command, ParseError};
 use connection::{
-    cleanup_stale_files, ensure_daemon, get_socket_dir, is_pid_alive, send_command, walk_daemons,
-    DaemonOptions,
+    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
+    send_command, walk_daemons, DaemonOptions, Response,
 };
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
@@ -58,6 +60,131 @@ fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
         "error": message.as_ref(),
         "type": error_type,
     }));
+}
+
+fn should_send_hide_scrollbars_launch_option(
+    cli_hide_scrollbars: bool,
+    hide_scrollbars: bool,
+) -> bool {
+    cli_hide_scrollbars || !hide_scrollbars
+}
+
+fn apply_hide_scrollbars_launch_option(
+    launch_cmd: &mut serde_json::Value,
+    cli_hide_scrollbars: bool,
+    hide_scrollbars: bool,
+) {
+    if should_send_hide_scrollbars_launch_option(cli_hide_scrollbars, hide_scrollbars) {
+        launch_cmd["hideScrollbars"] = json!(hide_scrollbars);
+    }
+}
+
+fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::PluginConfig]) {
+    cmd["plugins"] = json!(plugins);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmationPrompt {
+    action: String,
+    category: String,
+    description: String,
+    confirmation_id: String,
+}
+
+fn confirmation_prompt_from_data(data: &serde_json::Value) -> Option<ConfirmationPrompt> {
+    if data
+        .get("confirmation_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let action = data
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(ConfirmationPrompt {
+            action: action.clone(),
+            category: data
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: data
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(action.as_str())
+                .to_string(),
+            confirmation_id: data
+                .get("confirmation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+
+    data.get("result")
+        .and_then(|v| v.get("data"))
+        .and_then(confirmation_prompt_from_data)
+}
+
+fn confirmation_prompt_from_response(resp: &Response) -> Option<ConfirmationPrompt> {
+    resp.data.as_ref().and_then(confirmation_prompt_from_data)
+}
+
+fn run_interactive_confirmations(
+    mut resp: Response,
+    flags: &Flags,
+    output_opts: &OutputOptions,
+) -> Response {
+    while let Some(prompt) = confirmation_prompt_from_response(&resp) {
+        eprintln!("[agent-browser] Action requires confirmation:");
+        if prompt.category.is_empty() {
+            eprintln!("  {}", prompt.description);
+        } else {
+            eprintln!("  {}: {}", prompt.category, prompt.description);
+        }
+        eprint!("  Allow? [y/N]: ");
+
+        let mut input = String::new();
+        let approved = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            std::io::stdin().read_line(&mut input).is_ok()
+                && matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+        } else {
+            false
+        };
+
+        let confirm_cmd = if approved {
+            json!({
+                "id": gen_id(),
+                "action": "confirm",
+                "confirmationId": prompt.confirmation_id
+            })
+        } else {
+            json!({
+                "id": gen_id(),
+                "action": "deny",
+                "confirmationId": prompt.confirmation_id
+            })
+        };
+
+        match send_command(confirm_cmd, &flags.session) {
+            Ok(next_resp) => {
+                if !approved {
+                    eprintln!("{} Action denied", color::error_indicator());
+                    exit(1);
+                }
+                resp = next_resp;
+            }
+            Err(e) => {
+                eprintln!("{} {}", color::error_indicator(), e);
+                exit(1);
+            }
+        }
+    }
+
+    print_response_with_opts(&resp, None, output_opts);
+    resp
 }
 
 struct ParsedProxy {
@@ -602,6 +729,25 @@ fn main() {
         return;
     }
 
+    // Handle plugin registry commands (doesn't need daemon)
+    if matches!(
+        clean.first().map(|s| s.as_str()),
+        Some("plugin") | Some("plugins")
+    ) {
+        plugins::run_plugin_command(&clean, &flags.plugins, flags.json);
+        return;
+    }
+
+    // Handle MCP stdio server mode. This must never share stdout with normal
+    // CLI output because stdout is reserved for JSON-RPC protocol messages.
+    if clean.first().map(|s| s.as_str()) == Some("mcp") {
+        if let Err(err) = mcp::run_mcp(&clean[1..]) {
+            eprintln!("{} {}", color::error_indicator(), err);
+            exit(1);
+        }
+        return;
+    }
+
     // Handle session separately (doesn't need daemon)
     if clean.first().map(|s| s.as_str()) == Some("session") {
         run_session(&clean, &flags.session, flags.json);
@@ -679,6 +825,11 @@ fn main() {
         }
     }
 
+    // Send plugin config with commands so an already-running daemon can use
+    // current config without a restart. The daemon strips this from stream
+    // broadcasts before observers see the command payload.
+    attach_plugins_to_command(&mut cmd, &flags.plugins);
+
     // Validate session name before starting daemon
     if let Some(ref name) = flags.session_name {
         if !validation::is_valid_session_name(name) {
@@ -726,6 +877,8 @@ fn main() {
     } else {
         (None, None, None)
     };
+    let plugin_registry_json =
+        serde_json::to_string(&flags.plugins).unwrap_or_else(|_| "[]".to_string());
     let daemon_opts = DaemonOptions {
         headed: flags.headed,
         debug: flags.debug,
@@ -741,6 +894,7 @@ fn main() {
         proxy_password: proxy_password.as_deref(),
         ignore_https_errors: flags.ignore_https_errors,
         allow_file_access: flags.allow_file_access,
+        hide_scrollbars: flags.hide_scrollbars,
         profile: flags.profile.as_deref(),
         state: flags.state.as_deref(),
         provider: flags.provider.as_deref(),
@@ -756,6 +910,7 @@ fn main() {
         default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
         no_auto_dialog: flags.no_auto_dialog,
+        plugins: Some(plugin_registry_json.as_str()),
     };
 
     let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
@@ -813,6 +968,7 @@ fn main() {
             },
             flags.ignore_https_errors.then_some("--ignore-https-errors"),
             flags.cli_allow_file_access.then_some("--allow-file-access"),
+            flags.cli_hide_scrollbars.then_some("--hide-scrollbars"),
             flags.cli_download_path.then_some("--download-path"),
             flags.cli_headed.then_some("--headed"),
         ]
@@ -1028,6 +1184,7 @@ fn main() {
                 "action": "launch",
                 "provider": provider
             });
+            launch_cmd["plugins"] = json!(flags.plugins.clone());
 
             if let Some(ref cs) = flags.color_scheme {
                 launch_cmd["colorScheme"] = json!(cs);
@@ -1063,6 +1220,10 @@ fn main() {
         || flags.args.is_some()
         || flags.user_agent.is_some()
         || flags.allow_file_access
+        || should_send_hide_scrollbars_launch_option(
+            flags.cli_hide_scrollbars,
+            flags.hide_scrollbars,
+        )
         || flags.color_scheme.is_some()
         || flags.download_path.is_some()
         || flags.engine.is_some()
@@ -1076,6 +1237,7 @@ fn main() {
             "action": "launch",
             "headless": !flags.headed
         });
+        launch_cmd["plugins"] = json!(flags.plugins.clone());
 
         let cmd_obj = launch_cmd
             .as_object_mut()
@@ -1137,6 +1299,12 @@ fn main() {
             launch_cmd["allowFileAccess"] = json!(true);
         }
 
+        apply_hide_scrollbars_launch_option(
+            &mut launch_cmd,
+            flags.cli_hide_scrollbars,
+            flags.hide_scrollbars,
+        );
+
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
         }
@@ -1193,68 +1361,22 @@ fn main() {
                 .map(commands::shell_words_split)
                 .collect::<Vec<Vec<String>>>()
         });
-        run_batch(&flags, bail, arg_commands);
+        run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
 
     let output_opts = OutputOptions::from_flags(&flags);
 
-    match send_command(cmd.clone(), &flags.session) {
-        Ok(resp) => {
-            let success = resp.success;
-            // Handle interactive confirmation
-            if flags.confirm_interactive {
-                if let Some(data) = &resp.data {
-                    if data
-                        .get("confirmation_required")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        let desc = data
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown action");
-                        let category = data.get("category").and_then(|v| v.as_str()).unwrap_or("");
-                        let cid = data
-                            .get("confirmation_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        eprintln!("[agent-browser] Action requires confirmation:");
-                        eprintln!("  {}: {}", category, desc);
-                        eprint!("  Allow? [y/N]: ");
-
-                        let mut input = String::new();
-                        let approved = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                            std::io::stdin().read_line(&mut input).is_ok()
-                                && matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-                        } else {
-                            false
-                        };
-
-                        let confirm_cmd = if approved {
-                            json!({ "id": gen_id(), "action": "confirm", "confirmationId": cid })
-                        } else {
-                            json!({ "id": gen_id(), "action": "deny", "confirmationId": cid })
-                        };
-
-                        match send_command(confirm_cmd, &flags.session) {
-                            Ok(r) => {
-                                if !approved {
-                                    eprintln!("{} Action denied", color::error_indicator());
-                                    exit(1);
-                                }
-                                print_response_with_opts(&r, None, &output_opts);
-                            }
-                            Err(e) => {
-                                eprintln!("{} {}", color::error_indicator(), e);
-                                exit(1);
-                            }
-                        }
-                        return;
-                    }
+    match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
+        Ok(mut resp) => {
+            if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
+                resp = run_interactive_confirmations(resp, &flags, &output_opts);
+                if !resp.success {
+                    exit(1);
                 }
+                return;
             }
+            let success = resp.success;
             // Extract action for context-specific output handling
             let action = cmd.get("action").and_then(|v| v.as_str());
             print_response_with_opts(&resp, action, &output_opts);
@@ -1273,7 +1395,31 @@ fn main() {
     }
 }
 
-fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) {
+/// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
+/// longer pays a settle-sleep on every invocation, so a daemon that exited
+/// right after its liveness check surfaces as an unreachable socket on the
+/// request itself. Respawn once and retry before reporting failure.
+fn send_command_with_respawn(
+    cmd: serde_json::Value,
+    session: &str,
+    daemon_opts: &DaemonOptions,
+) -> Result<connection::Response, String> {
+    let first_attempt = send_command(cmd.clone(), session);
+    match first_attempt {
+        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
+            Ok(_) => send_command(cmd, session),
+            Err(_) => first_attempt,
+        },
+        other => other,
+    }
+}
+
+fn run_batch(
+    flags: &Flags,
+    daemon_opts: &DaemonOptions,
+    bail: bool,
+    arg_commands: Option<Vec<Vec<String>>>,
+) {
     let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
         cmds
     } else {
@@ -1326,7 +1472,7 @@ fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) 
             continue;
         }
 
-        let parsed = match parse_command(cmd_args, flags) {
+        let mut parsed = match parse_command(cmd_args, flags) {
             Ok(c) => c,
             Err(e) => {
                 had_error = true;
@@ -1358,8 +1504,9 @@ fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) 
             .get("action")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        attach_plugins_to_command(&mut parsed, &flags.plugins);
 
-        match send_command(parsed, &flags.session) {
+        match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {
                 if flags.json {
                     results.push(json!({
@@ -1488,5 +1635,77 @@ mod tests {
             parsed["error"],
             "Daemon process exited during startup:\nline \"quoted\"\u{001b}[2mansi\u{001b}[22m"
         );
+    }
+
+    #[test]
+    fn test_hide_scrollbars_launch_option_serialization() {
+        assert!(!should_send_hide_scrollbars_launch_option(false, true));
+        assert!(should_send_hide_scrollbars_launch_option(false, false));
+        assert!(should_send_hide_scrollbars_launch_option(true, true));
+
+        let mut default_cmd = json!({ "action": "launch" });
+        apply_hide_scrollbars_launch_option(&mut default_cmd, false, true);
+        assert!(default_cmd.get("hideScrollbars").is_none());
+
+        let mut config_false_cmd = json!({ "action": "launch" });
+        apply_hide_scrollbars_launch_option(&mut config_false_cmd, false, false);
+        assert_eq!(config_false_cmd["hideScrollbars"], false);
+
+        let mut cli_true_cmd = json!({ "action": "launch" });
+        apply_hide_scrollbars_launch_option(&mut cli_true_cmd, true, true);
+        assert_eq!(cli_true_cmd["hideScrollbars"], true);
+    }
+
+    #[test]
+    fn test_attach_plugins_to_command_adds_registry_payload() {
+        let plugins = vec![crate::plugins::PluginConfig {
+            name: "stealth".to_string(),
+            command: "agent-browser-plugin-stealth".to_string(),
+            capabilities: vec!["launch.mutate".to_string()],
+            ..crate::plugins::PluginConfig::default()
+        }];
+        let mut cmd = json!({ "action": "navigate", "url": "https://example.com" });
+
+        attach_plugins_to_command(&mut cmd, &plugins);
+
+        assert_eq!(cmd["plugins"][0]["name"], "stealth");
+        assert_eq!(cmd["plugins"][0]["capabilities"][0], "launch.mutate");
+    }
+
+    #[test]
+    fn test_attach_plugins_to_command_adds_empty_registry_payload() {
+        let mut cmd = json!({ "action": "navigate", "url": "https://example.com" });
+
+        attach_plugins_to_command(&mut cmd, &[]);
+
+        assert_eq!(cmd["plugins"], json!([]));
+    }
+
+    #[test]
+    fn test_confirmation_prompt_from_response_finds_nested_confirm_result() {
+        let resp = Response {
+            success: true,
+            data: Some(json!({
+                "confirmed": true,
+                "action": "navigate",
+                "result": {
+                    "id": "original-command",
+                    "success": true,
+                    "data": {
+                        "confirmation_required": true,
+                        "confirmation_id": "original-command",
+                        "action": "plugin:stealth:launch.mutate"
+                    }
+                }
+            })),
+            error: None,
+            warning: None,
+        };
+
+        let prompt = confirmation_prompt_from_response(&resp).unwrap();
+
+        assert_eq!(prompt.action, "plugin:stealth:launch.mutate");
+        assert_eq!(prompt.description, "plugin:stealth:launch.mutate");
+        assert_eq!(prompt.confirmation_id, "original-command");
     }
 }
