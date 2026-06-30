@@ -2457,10 +2457,13 @@ and `record overlay` commands for presentation emphasis. The default cursor
 preset renders effects in the recorded page. Demo mode records a stable
 compositor surface so cursor, overlay, spotlight, and zoom animations remain
 independent of page navigation.
-Text overlays serialize and auto-dismiss after --duration-ms.
-Spotlight fades out after --duration-ms; selector targets derive radius from
-the target box, and any target can pass --radius to override it.
+Text overlays serialize, stay visible for --duration-ms, and auto-dismiss
+before the next command continues. Spotlight stays visible for --duration-ms;
+selector targets derive radius from the target box, and any target can pass
+--radius to override it.
 Zoom holds until reset unless you pass --duration-ms for a temporary zoom.
+Zoom commands wait for their camera transition so compact batches capture the
+animation without explicit wait commands.
 Recordings are silent; narration, click SFX, and typing SFX are out of scope
 for the screenshot-plus-ffmpeg pipeline.
 Demo mode defaults to a 700 ms cursor tween and 500 ms click ripple unless

@@ -101,7 +101,7 @@ agent-browser record zoom to --x 640 --y 360 --scale 1.45
 agent-browser record zoom reset
 ```
 
-Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize and auto-dismiss after `--duration-ms`. Spotlight fades out after `--duration-ms`; selector targets derive radius from the element box, and any target can pass `--radius` to override it. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. Recordings are silent; narration and SFX are not mixed into the screenshot-plus-ffmpeg pipeline.
+Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, stay visible for `--duration-ms`, and auto-dismiss before the next command continues. Spotlight holds for `--duration-ms`; selector targets derive radius from the element box, and any target can pass `--radius` to override it. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. `record zoom to` waits for the camera transition, and `record zoom reset` waits for the reset transition, so compact command batches naturally capture the zoom animation. Recordings are silent; narration and SFX are not mixed into the screenshot-plus-ffmpeg pipeline.
 
 ### Sync Model
 

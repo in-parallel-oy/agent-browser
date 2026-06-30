@@ -1307,7 +1307,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_OVERLAY,
             "Record overlay",
-            "Add or clear a browser-rendered recording overlay. Text overlays auto-dismiss after durationMs. In demo mode, overlay display time is captured while idle gaps between tool calls are skipped.",
+            "Add or clear a browser-rendered recording overlay. Text overlays and spotlights hold for durationMs before the next command continues. In demo mode, overlay display time is captured while idle gaps between tool calls are skipped.",
             json!({
                 "kind": { "type": "string", "enum": ["text", "spotlight", "clear"] },
                 "text": { "type": "string" },
@@ -1323,7 +1323,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_ZOOM,
             "Record zoom",
-            "Apply or reset deliberate browser-rendered recording zoom. Use zoom separately from clicks: overlay what will happen, zoom to a selector or x/y point for emphasis, click or fill, then reset before stopping.",
+            "Apply or reset deliberate browser-rendered recording zoom. Zoom commands wait for the camera transition, so compact batches capture the animation. Use zoom separately from clicks: overlay what will happen, zoom to a selector or x/y point for emphasis, click or fill, then reset before stopping.",
             json!({
                 "mode": { "type": "string", "enum": ["to", "reset"] },
                 "selector": { "type": "string" },
@@ -2806,6 +2806,10 @@ fn call_profiler_start(arguments: &Value) -> Result<Value, ProtocolError> {
 }
 
 fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, record_start_args(arguments, action)?, None)
+}
+
+fn record_start_args(arguments: &Value, action: &str) -> Result<Vec<String>, ProtocolError> {
     let path = required_string(arguments, "path")?;
     let mut args = vec!["record".to_string(), action.to_string(), path];
     if let Some(url) = optional_string(arguments, "url")? {
@@ -2872,7 +2876,7 @@ fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolE
         args.push(input_mode);
     }
     append_optional_u64_arg(arguments, &mut args, "inputDelayMs", "--input-delay-ms")?;
-    call_cli_tool(arguments, args, None)
+    Ok(args)
 }
 
 fn append_optional_u64_arg(
@@ -4140,6 +4144,14 @@ mod tests {
             record["inputSchema"]["properties"]["recordEffects"]["enum"],
             json!(["cursor", "demo", "off"])
         );
+        assert_eq!(
+            record["inputSchema"]["properties"]["recordMode"]["enum"],
+            json!(["automation", "demo"])
+        );
+        assert_eq!(
+            restart["inputSchema"]["properties"]["recordMode"]["enum"],
+            json!(["automation", "demo"])
+        );
         assert!(record["inputSchema"]["properties"]
             .get("recordFps")
             .is_none());
@@ -4153,6 +4165,23 @@ mod tests {
         assert_eq!(
             restart["inputSchema"]["properties"]["cursorBlockClicks"]["type"],
             "boolean"
+        );
+    }
+
+    #[test]
+    fn record_start_args_include_record_mode() {
+        let args = record_start_args(
+            &json!({
+                "path": "demo.webm",
+                "recordMode": "demo",
+            }),
+            "start",
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec!["record", "start", "demo.webm", "--record-mode", "demo",]
         );
     }
 

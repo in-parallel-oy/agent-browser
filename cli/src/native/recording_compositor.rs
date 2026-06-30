@@ -1,5 +1,7 @@
 use base64::Engine;
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -187,10 +189,12 @@ pub fn spawn_compositor_recording_task(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut started_at = None;
         let mut segment_frames_written = 0_u64;
-        let mut last_source_frame: Option<String> = None;
+        let mut last_source_frame_hash: Option<u64> = None;
+        let mut terminal_error: Option<String> = None;
         let mut last_source_refresh = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
+        let source_refresh_interval = recording::capture_interval(fps);
 
         let source_params = CaptureScreenshotParams {
             format: Some("jpeg".to_string()),
@@ -233,29 +237,41 @@ pub fn spawn_compositor_recording_task(
                 }
             }
 
-            if last_source_refresh.elapsed() >= Duration::from_millis(120) {
+            if last_source_refresh.elapsed() >= source_refresh_interval {
                 last_source_refresh = Instant::now();
-                let source_update = async {
-                    let source = client
-                        .send_command_typed::<_, CaptureScreenshotResult>(
-                            "Page.captureScreenshot",
-                            &source_params,
-                            Some(&source_session_id),
-                        )
-                        .await?;
-                    if last_source_frame.as_deref() != Some(source.data.as_str()) {
-                        compositor.set_frame(&source.data).await?;
-                        last_source_frame = Some(source.data);
+                match client
+                    .send_command_typed::<_, CaptureScreenshotResult>(
+                        "Page.captureScreenshot",
+                        &source_params,
+                        Some(&source_session_id),
+                    )
+                    .await
+                {
+                    Ok(source) => {
+                        let frame_hash = stable_hash(&source.data);
+                        if last_source_frame_hash != Some(frame_hash) {
+                            match compositor.set_frame(&source.data).await {
+                                Ok(()) => last_source_frame_hash = Some(frame_hash),
+                                Err(e) if is_terminal_cdp_error(&e) => {
+                                    terminal_error =
+                                        Some(format!("Recording compositor target closed: {}", e));
+                                    break;
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
-                    Ok::<(), String>(())
-                };
-                let _ = tokio::time::timeout(Duration::from_millis(90), source_update).await;
-                if last_source_frame.is_none() {
+                    Err(e) if is_terminal_cdp_error(&e) => {
+                        terminal_error = Some(format!("Recording source target closed: {}", e));
+                        break;
+                    }
+                    Err(_) => {}
+                }
+                if last_source_frame_hash.is_none() {
                     continue;
                 }
             }
 
-            compositor.activate().await;
             let screenshot = match compositor
                 .client
                 .send_command_typed::<_, CaptureScreenshotResult>(
@@ -266,8 +282,29 @@ pub fn spawn_compositor_recording_task(
                 .await
             {
                 Ok(s) => s,
+                Err(e) if is_terminal_cdp_error(&e) => {
+                    terminal_error = Some(format!("Recording compositor target closed: {}", e));
+                    break;
+                }
                 Err(_) => {
-                    continue;
+                    compositor.activate().await;
+                    match compositor
+                        .client
+                        .send_command_typed::<_, CaptureScreenshotResult>(
+                            "Page.captureScreenshot",
+                            &compositor_params,
+                            Some(&compositor.session_id),
+                        )
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) if is_terminal_cdp_error(&e) => {
+                            terminal_error =
+                                Some(format!("Recording compositor target closed: {}", e));
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
                 }
             };
 
@@ -306,8 +343,28 @@ pub fn spawn_compositor_recording_task(
             return Err(format!("ffmpeg failed: {}", stderr));
         }
 
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
+
         Ok(())
     })
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn is_terminal_cdp_error(error: &str) -> bool {
+    error.contains("Target closed")
+        || error.contains("Session closed")
+        || error.contains("Session with given id not found")
+        || error.contains("not found")
+        || error.contains("WebSocket")
+        || error.contains("connection")
+        || error.contains("disconnected")
 }
 
 pub async fn viewport_for_session(
@@ -795,7 +852,6 @@ const COMPOSITOR_RUNTIME_JS: &str = r#"
 
   async function setFrame(jpegBase64) {
     const src = `data:image/jpeg;base64,${jpegBase64}`;
-    if (frame.src === src) return;
     frame.src = src;
     if (frame.decode) {
       await frame.decode().catch(() => {});

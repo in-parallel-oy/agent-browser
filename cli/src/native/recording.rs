@@ -88,10 +88,13 @@ impl RecordingCaptureGate {
 
     pub(crate) async fn wait_until_active(&self) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_active().await {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }

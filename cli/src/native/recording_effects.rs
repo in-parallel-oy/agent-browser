@@ -397,6 +397,16 @@ impl RecordingEffectsState {
         state
     }
 
+    pub fn new_with_preinstalled_target(
+        config: RecordingEffectsConfig,
+        client: Arc<CdpClient>,
+        session_id: String,
+    ) -> Self {
+        let mut state = Self::new_with_target(config, client, session_id);
+        state.runtime_installed = true;
+        state
+    }
+
     pub fn config(&self) -> &RecordingEffectsConfig {
         &self.config
     }
@@ -407,12 +417,13 @@ impl RecordingEffectsState {
     }
 
     pub async fn install(&mut self) -> Result<(), String> {
-        if self.runtime_installed {
-            return Ok(());
-        }
         if let Some(runtime) = self.runtime() {
-            runtime.install().await?;
-            self.runtime_installed = true;
+            if self.runtime_installed {
+                runtime.configure().await?;
+            } else {
+                runtime.install().await?;
+                self.runtime_installed = true;
+            }
         }
         Ok(())
     }

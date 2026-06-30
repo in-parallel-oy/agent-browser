@@ -288,6 +288,7 @@ pub struct DaemonState {
     /// Recording-scoped effects timeline used by cursor/demo recording modes.
     pub recording_effects: Option<Arc<Mutex<RecordingEffectsState>>>,
     pub recording_compositor: Option<RecordingCompositor>,
+    recording_internal_target_ids: HashSet<String>,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -354,6 +355,7 @@ impl DaemonState {
             viewport: None,
             recording_effects: None,
             recording_compositor: None,
+            recording_internal_target_ids: HashSet::new(),
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             confirmed_policy_actions: HashSet::new(),
@@ -649,6 +651,8 @@ impl DaemonState {
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
         self.recording_state.cancel_tx = Some(cancel_tx);
+        self.recording_internal_target_ids
+            .insert(compositor.target_id.clone());
         self.recording_compositor = Some(compositor);
         Ok(())
     }
@@ -825,7 +829,11 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if should_track_target(&te.target_info) {
+                                if !self
+                                    .recording_internal_target_ids
+                                    .contains(&te.target_info.target_id)
+                                    && should_track_target(&te.target_info)
+                                {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -842,7 +850,11 @@ impl DaemonState {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
                                 event.params.clone(),
                             ) {
-                                if should_track_target(&te.target_info) {
+                                if !self
+                                    .recording_internal_target_ids
+                                    .contains(&te.target_info.target_id)
+                                    && should_track_target(&te.target_info)
+                                {
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -1916,7 +1928,8 @@ async fn demo_recording_action_preroll_duration(
     state: &DaemonState,
 ) -> std::time::Duration {
     let ms = match action {
-        "recording_overlay" | "recording_zoom" => 350,
+        "recording_overlay" => demo_recording_overlay_preroll_ms(cmd),
+        "recording_zoom" => demo_recording_zoom_preroll_ms(cmd),
         "fill" | "type" | "keyboard" | "input_keyboard" | "inserttext" => {
             let text_len = cmd
                 .get("text")
@@ -1949,6 +1962,30 @@ async fn demo_recording_action_preroll_duration(
         _ => 350,
     };
     std::time::Duration::from_millis(ms.min(DEMO_CAPTURE_MAX_ACTION_MS))
+}
+
+fn demo_recording_overlay_preroll_ms(cmd: &Value) -> u64 {
+    let duration_ms = cmd
+        .get("durationMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5_000);
+    match cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("text") {
+        "clear" => 350,
+        "spotlight" | "text" => duration_ms.saturating_add(300),
+        _ => 350,
+    }
+}
+
+fn demo_recording_zoom_preroll_ms(cmd: &Value) -> u64 {
+    match cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("to") {
+        "reset" => 900,
+        "to" => cmd
+            .get("durationMs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(650)
+            .saturating_add(900),
+        _ => 350,
+    }
 }
 
 async fn demo_recording_cursor_preroll_ms(state: &DaemonState) -> u64 {
@@ -2954,6 +2991,11 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
                 .await;
             }
         }
+    }
+    if state.recording_state.active || state.recording_state.capture_task.is_some() {
+        let _ = state.stop_recording_task().await;
+        let _ = recording::recording_stop(&mut state.recording_state);
+        clear_recording_effects(state).await;
     }
     close_current_browser(state).await?;
 
@@ -4758,6 +4800,10 @@ async fn handle_profiler_stop(cmd: &Value, state: &mut DaemonState) -> Result<Va
 }
 
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.recording_state.active {
+        return Err("Recording already active".to_string());
+    }
+
     let path = cmd
         .get("path")
         .and_then(|v| v.as_str())
@@ -4942,7 +4988,14 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .map(|c| (c.client.clone(), c.session_id.clone()))
         .unwrap_or_else(|| (client.clone(), new_session_id.clone()));
 
-    setup_recording_effects(state, effects_config, effects_client, effects_session_id).await?;
+    setup_recording_effects(
+        state,
+        effects_config,
+        effects_client,
+        effects_session_id,
+        compositor.is_some(),
+    )
+    .await?;
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
     if demo_capture {
@@ -5052,7 +5105,14 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
             .map(|c| (c.client.clone(), c.session_id.clone()))
             .unwrap_or_else(|| (client.clone(), session_id.clone()));
 
-        setup_recording_effects(state, effects_config, effects_client, effects_session_id).await?;
+        setup_recording_effects(
+            state,
+            effects_config,
+            effects_client,
+            effects_session_id,
+            compositor.is_some(),
+        )
+        .await?;
 
         if let Some(compositor) = compositor {
             state
@@ -5082,12 +5142,16 @@ async fn setup_recording_effects(
     effects_config: Option<RecordingEffectsConfig>,
     client: Arc<CdpClient>,
     session_id: String,
+    runtime_preinstalled: bool,
 ) -> Result<Option<Arc<Mutex<RecordingEffectsState>>>, String> {
     let device_scale_factor = state.viewport.map(|(_, _, scale, _)| scale).unwrap_or(1.0);
     let effects = match effects_config {
         Some(config) => {
-            let mut effects_state =
-                RecordingEffectsState::new_with_target(config, client, session_id);
+            let mut effects_state = if runtime_preinstalled {
+                RecordingEffectsState::new_with_preinstalled_target(config, client, session_id)
+            } else {
+                RecordingEffectsState::new_with_target(config, client, session_id)
+            };
             effects_state.set_device_scale_factor(device_scale_factor);
             effects_state.install().await?;
             Some(Arc::new(Mutex::new(effects_state)))
@@ -5143,6 +5207,9 @@ async fn clear_recording_effects(state: &mut DaemonState) {
     }
     state.recording_effects = None;
     if let Some(compositor) = state.recording_compositor.take() {
+        state
+            .recording_internal_target_ids
+            .remove(&compositor.target_id);
         compositor.close().await;
     }
     state.recording_state.stop_post_roll = std::time::Duration::ZERO;
@@ -5173,6 +5240,8 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
             RecordingEffectsHandle { shared: effects }
                 .overlay_text(text.to_string(), position, duration_ms)
                 .await?;
+            state.extend_demo_recording_from_effects().await;
+            tokio::time::sleep(std::time::Duration::from_millis(duration_ms.max(1))).await;
             Ok(json!({ "overlay": "text" }))
         }
         "spotlight" => {
@@ -5184,12 +5253,15 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
             RecordingEffectsHandle { shared: effects }
                 .spotlight(x, y, duration_ms, radius)
                 .await?;
+            state.extend_demo_recording_from_effects().await;
+            tokio::time::sleep(std::time::Duration::from_millis(duration_ms.max(1))).await;
             Ok(json!({ "overlay": "spotlight", "x": x, "y": y, "radius": radius }))
         }
         "clear" => {
             RecordingEffectsHandle { shared: effects }
                 .clear_overlay()
                 .await?;
+            state.extend_demo_recording_from_effects().await;
             Ok(json!({ "overlay": "cleared" }))
         }
         other => Err(format!(
@@ -5249,12 +5321,15 @@ async fn handle_recording_zoom(cmd: &Value, state: &DaemonState) -> Result<Value
             RecordingEffectsHandle { shared: effects }
                 .zoom_to(x, y, scale, duration_ms)
                 .await?;
+            state.extend_demo_recording_from_effects().await;
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             Ok(json!({ "zoom": "to", "x": x, "y": y, "scale": scale }))
         }
         "reset" => {
             RecordingEffectsHandle { shared: effects }
                 .zoom_reset()
                 .await?;
+            state.extend_demo_recording_from_effects().await;
             Ok(json!({ "zoom": "reset" }))
         }
         other => Err(format!(
