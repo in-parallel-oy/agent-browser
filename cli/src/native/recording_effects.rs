@@ -399,16 +399,6 @@ impl RecordingEffectsState {
         state
     }
 
-    pub fn new_with_preinstalled_target(
-        config: RecordingEffectsConfig,
-        client: Arc<CdpClient>,
-        session_id: String,
-    ) -> Self {
-        let mut state = Self::new_with_target(config, client, session_id);
-        state.runtime_installed = true;
-        state
-    }
-
     pub fn config(&self) -> &RecordingEffectsConfig {
         &self.config
     }
@@ -423,8 +413,13 @@ impl RecordingEffectsState {
             if self.runtime_installed {
                 runtime.configure().await?;
             } else {
-                self.init_script_identifier = runtime.install_for_new_documents().await.ok();
-                runtime.install().await?;
+                let identifier = runtime.install_for_new_documents().await?;
+                self.init_script_identifier = Some(identifier.clone());
+                if let Err(err) = runtime.install().await {
+                    let _ = runtime.remove_new_document_script(&identifier).await;
+                    self.init_script_identifier = None;
+                    return Err(err);
+                }
                 self.runtime_installed = true;
             }
         }
@@ -435,12 +430,24 @@ impl RecordingEffectsState {
         let Some(runtime) = self.runtime() else {
             return Ok(());
         };
-        let cleanup_result = runtime.cleanup().await;
-        if let Some(identifier) = self.init_script_identifier.take() {
-            let _ = runtime.remove_new_document_script(&identifier).await;
+        let mut error = runtime.cleanup().await.err();
+        if let Some(identifier) = self.init_script_identifier.clone() {
+            match runtime.remove_new_document_script(&identifier).await {
+                Ok(()) => {
+                    self.init_script_identifier = None;
+                }
+                Err(err) => {
+                    if error.is_none() {
+                        error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = error {
+            return Err(err);
         }
         self.runtime_installed = false;
-        cleanup_result
+        Ok(())
     }
 
     fn runtime(&self) -> Option<RecordingEffectsRuntime> {

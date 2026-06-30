@@ -2756,7 +2756,26 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'url' parameter")?;
+    let wait_until = cmd
+        .get("waitUntil")
+        .and_then(|v| v.as_str())
+        .map(WaitUntil::from_str)
+        .unwrap_or(WaitUntil::Load);
+    let scoped_headers = cmd
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .filter(|m| !m.is_empty());
 
+    navigate_active_page(state, url, wait_until, scoped_headers, "navigate").await
+}
+
+async fn navigate_active_page(
+    state: &mut DaemonState,
+    url: &str,
+    wait_until: WaitUntil,
+    scoped_headers: Option<&serde_json::Map<String, Value>>,
+    reason: &'static str,
+) -> Result<Value, String> {
     {
         let df = state.domain_filter.read().await;
         if let Some(ref filter) = *df {
@@ -2767,7 +2786,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     // WebDriver backend path
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            state.ref_map.clear_with_reason(Some("navigate"));
+            state.ref_map.clear_with_reason(Some(reason));
             wb.navigate(url).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
@@ -2776,20 +2795,6 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     }
 
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-
-    let wait_until = cmd
-        .get("waitUntil")
-        .and_then(|v| v.as_str())
-        .map(WaitUntil::from_str)
-        .unwrap_or(WaitUntil::Load);
-
-    // If --headers was passed, store them keyed by origin and enable Fetch
-    // interception. The background fetch_handler_task (started on launch)
-    // injects them into matching requests in real-time.
-    let scoped_headers = cmd
-        .get("headers")
-        .and_then(|v| v.as_object())
-        .filter(|m| !m.is_empty());
 
     if let Some(headers_map) = scoped_headers {
         if let Some(origin) = url::Url::parse(url)
@@ -2825,7 +2830,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
-    state.ref_map.clear_with_reason(Some("navigate"));
+    state.ref_map.clear_with_reason(Some(reason));
     state.iframe_sessions.clear();
     state.active_frame_id = None;
     mgr.navigate(url, wait_until).await
@@ -2955,7 +2960,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     if state.recording_state.active || state.recording_state.capture_task.is_some() {
         let _ = state.stop_recording_task().await;
         let _ = recording::recording_stop(&mut state.recording_state);
-        clear_recording_effects(state).await;
+        let _ = clear_recording_effects(state).await;
     }
     close_current_browser(state).await?;
 
@@ -4799,35 +4804,29 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         (mgr.client.clone(), mgr.active_session_id()?.to_string())
     };
 
-    setup_recording_effects(
-        state,
-        effects_config,
-        client.clone(),
-        session_id.clone(),
-        false,
-    )
-    .await?;
-
     if let Some(url) = recording_url {
-        state
-            .ref_map
-            .clear_with_reason(Some("recording start navigate"));
-        state.iframe_sessions.clear();
-        state.active_frame_id = None;
-        state
-            .browser
-            .as_mut()
-            .ok_or("Browser not launched")?
-            .navigate(&url, WaitUntil::Load)
-            .await?;
+        navigate_active_page(
+            state,
+            &url,
+            WaitUntil::Load,
+            None,
+            "recording start navigate",
+        )
+        .await?;
     }
+
+    setup_recording_effects(state, effects_config, client.clone(), session_id.clone()).await?;
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
     if demo_capture {
         state.recording_state.capture_gate =
             Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
     }
-    state.start_recording_task(client, session_id).await?;
+    if let Err(err) = state.start_recording_task(client, session_id).await {
+        let _ = recording::recording_stop(&mut state.recording_state);
+        let _ = clear_recording_effects(state).await;
+        return Err(err);
+    }
     if demo_capture {
         state
             .activate_demo_recording_for(std::time::Duration::from_millis(
@@ -4847,13 +4846,14 @@ async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String>
     let task_result = state.stop_recording_task().await;
     let result = recording::recording_stop(&mut state.recording_state);
 
-    clear_recording_effects(state).await;
+    let clear_result = clear_recording_effects(state).await;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(false, &state.engine).await;
     }
 
     task_result?;
+    clear_result?;
     result
 }
 
@@ -4876,13 +4876,20 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     };
     state.recording_state.fps = fps;
 
-    let _ = state.stop_recording_task().await;
+    let (client, session_id) = {
+        let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+        (
+            browser.client.clone(),
+            browser.active_session_id()?.to_string(),
+        )
+    };
 
-    clear_recording_effects(state).await;
-
-    let effects_config = recording_effects_config_from_cmd(cmd)?;
-    let demo_capture = matches!(recording_mode_from_cmd(cmd)?, RecordMode::Demo);
-
+    let stop_task_result =
+        if state.recording_state.active || state.recording_state.capture_task.is_some() {
+            Some(state.stop_recording_task().await)
+        } else {
+            None
+        };
     let previous_path = if state.recording_state.active {
         recording::recording_stop(&mut state.recording_state)
             .ok()
@@ -4890,12 +4897,26 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     } else {
         None
     };
+    clear_recording_effects(state).await?;
+    if let Some(result) = stop_task_result {
+        result?;
+    }
 
-    let recording_target = state.browser.as_ref().map(|browser| {
-        browser
-            .active_session_id()
-            .map(|session_id| (browser.client.clone(), session_id.to_string()))
-    });
+    let effects_config = recording_effects_config_from_cmd(cmd)?;
+    let demo_capture = matches!(recording_mode_from_cmd(cmd)?, RecordMode::Demo);
+
+    if let Some(url) = recording_url {
+        navigate_active_page(
+            state,
+            &url,
+            WaitUntil::Load,
+            None,
+            "recording restart navigate",
+        )
+        .await?;
+    }
+
+    setup_recording_effects(state, effects_config, client.clone(), session_id.clone()).await?;
 
     recording::recording_start(&mut state.recording_state, path)?;
     if demo_capture {
@@ -4903,38 +4924,17 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
             Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
     }
 
-    if let Some((client, session_id)) = recording_target.transpose()? {
-        setup_recording_effects(
-            state,
-            effects_config,
-            client.clone(),
-            session_id.clone(),
-            false,
-        )
-        .await?;
-
-        if let Some(url) = recording_url {
-            state
-                .ref_map
-                .clear_with_reason(Some("recording restart navigate"));
-            state.iframe_sessions.clear();
-            state.active_frame_id = None;
-            state
-                .browser
-                .as_mut()
-                .ok_or("Browser not launched")?
-                .navigate(&url, WaitUntil::Load)
-                .await?;
-        }
-
-        state.start_recording_task(client, session_id).await?;
-        if demo_capture {
-            state
-                .activate_demo_recording_for(std::time::Duration::from_millis(
-                    DEMO_CAPTURE_START_PREROLL_MS,
-                ))
-                .await;
-        }
+    if let Err(err) = state.start_recording_task(client, session_id).await {
+        let _ = recording::recording_stop(&mut state.recording_state);
+        let _ = clear_recording_effects(state).await;
+        return Err(err);
+    }
+    if demo_capture {
+        state
+            .activate_demo_recording_for(std::time::Duration::from_millis(
+                DEMO_CAPTURE_START_PREROLL_MS,
+            ))
+            .await;
     }
 
     Ok(json!({
@@ -4949,16 +4949,12 @@ async fn setup_recording_effects(
     effects_config: Option<RecordingEffectsConfig>,
     client: Arc<CdpClient>,
     session_id: String,
-    runtime_preinstalled: bool,
 ) -> Result<Option<Arc<Mutex<RecordingEffectsState>>>, String> {
     let device_scale_factor = state.viewport.map(|(_, _, scale, _)| scale).unwrap_or(1.0);
     let effects = match effects_config {
         Some(config) => {
-            let mut effects_state = if runtime_preinstalled {
-                RecordingEffectsState::new_with_preinstalled_target(config, client, session_id)
-            } else {
-                RecordingEffectsState::new_with_target(config, client, session_id)
-            };
+            let mut effects_state =
+                RecordingEffectsState::new_with_target(config, client, session_id);
             effects_state.set_device_scale_factor(device_scale_factor);
             effects_state.install().await?;
             Some(Arc::new(Mutex::new(effects_state)))
@@ -5005,15 +5001,16 @@ fn recording_mode_from_cmd(cmd: &Value) -> Result<RecordMode, String> {
     }
 }
 
-async fn clear_recording_effects(state: &mut DaemonState) {
+async fn clear_recording_effects(state: &mut DaemonState) -> Result<(), String> {
     if let Some(ref effects) = state.recording_effects {
         let handle = RecordingEffectsHandle {
             shared: effects.clone(),
         };
-        let _ = handle.cleanup().await;
+        handle.cleanup().await?;
     }
     state.recording_effects = None;
     state.recording_state.stop_post_roll = std::time::Duration::ZERO;
+    Ok(())
 }
 
 async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
