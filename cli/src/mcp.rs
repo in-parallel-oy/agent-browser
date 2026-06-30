@@ -1286,7 +1286,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_START,
             "Record start",
-            "Start video recording. In demo mode, recording captures visual activity and automatically pauses between agent/tool calls, so inference delays do not create idle video.",
+            "Start video recording of the current live page. In demo mode, recording captures visual activity and automatically pauses between agent/tool calls, so inference delays do not create idle video.",
             recording_tool_properties(),
             &["path"],
         ),
@@ -1300,7 +1300,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_RESTART,
             "Record restart",
-            "Restart video recording.",
+            "Restart video recording of the current live page.",
             recording_tool_properties(),
             &["path"],
         ),

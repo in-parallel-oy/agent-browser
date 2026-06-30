@@ -16,9 +16,9 @@ use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
-    DispatchMouseEventParams, ExceptionThrownEvent, JavascriptDialogOpeningEvent,
-    TargetCreatedEvent, TargetDestroyedEvent, TargetInfoChangedEvent,
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
+    ExceptionThrownEvent, JavascriptDialogOpeningEvent, TargetCreatedEvent, TargetDestroyedEvent,
+    TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -30,7 +30,6 @@ use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
 use super::recording::{self, RecordingState};
-use super::recording_compositor::{self, RecordingCompositor};
 use super::recording_effects::{
     InputMode, OverlayPosition, RecordEffectsPreset, RecordMode, RecordingEffectsConfig,
     RecordingEffectsHandle, RecordingEffectsState,
@@ -287,8 +286,6 @@ pub struct DaemonState {
     /// when no recording is active or `--cursor` was not passed.
     /// Recording-scoped effects timeline used by cursor/demo recording modes.
     pub recording_effects: Option<Arc<Mutex<RecordingEffectsState>>>,
-    pub recording_compositor: Option<RecordingCompositor>,
-    recording_internal_target_ids: HashSet<String>,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -354,8 +351,6 @@ impl DaemonState {
                 .unwrap_or(25_000),
             viewport: None,
             recording_effects: None,
-            recording_compositor: None,
-            recording_internal_target_ids: HashSet::new(),
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             confirmed_policy_actions: HashSet::new(),
@@ -630,33 +625,6 @@ impl DaemonState {
         Ok(())
     }
 
-    async fn start_compositor_recording_task(
-        &mut self,
-        source_client: Arc<CdpClient>,
-        source_session_id: String,
-        compositor: RecordingCompositor,
-    ) -> Result<(), String> {
-        let shared_count = Arc::new(AtomicU64::new(0));
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let handle = recording_compositor::spawn_compositor_recording_task(
-            source_client,
-            source_session_id,
-            compositor.clone(),
-            self.recording_state.output_path.clone(),
-            self.recording_state.fps,
-            shared_count.clone(),
-            cancel_rx,
-            self.recording_state.capture_gate.clone(),
-        );
-        self.recording_state.capture_task = Some(handle);
-        self.recording_state.shared_frame_count = Some(shared_count);
-        self.recording_state.cancel_tx = Some(cancel_tx);
-        self.recording_internal_target_ids
-            .insert(compositor.target_id.clone());
-        self.recording_compositor = Some(compositor);
-        Ok(())
-    }
-
     async fn stop_recording_task(&mut self) -> Result<(), String> {
         let mut post_roll = self.recording_state.stop_post_roll;
         if let Some(ref effects) = self.recording_effects {
@@ -829,11 +797,7 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if !self
-                                    .recording_internal_target_ids
-                                    .contains(&te.target_info.target_id)
-                                    && should_track_target(&te.target_info)
-                                {
+                                if should_track_target(&te.target_info) {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -850,11 +814,7 @@ impl DaemonState {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
                                 event.params.clone(),
                             ) {
-                                if !self
-                                    .recording_internal_target_ids
-                                    .contains(&te.target_info.target_id)
-                                    && should_track_target(&te.target_info)
-                                {
+                                if should_track_target(&te.target_info) {
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -4812,7 +4772,8 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     let recording_url = cmd
         .get("url")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let viewport = state.viewport;
 
@@ -4828,187 +4789,45 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     let effects_config = recording_effects_config_from_cmd(cmd)?;
     let demo_capture = matches!(recording_mode_from_cmd(cmd)?, RecordMode::Demo);
 
-    let (client, new_session_id, browser_context_id) = {
+    let (client, session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let old_session_id = mgr.active_session_id()?.to_string();
-
-        // Capture current URL if no URL specified
-        let nav_url = if let Some(u) = recording_url {
-            u.to_string()
-        } else {
-            mgr.get_url()
-                .await
-                .unwrap_or_else(|_| "about:blank".to_string())
-        };
-
-        // Capture current cookies
-        let cookies_result = mgr
-            .client
-            .send_command_no_params("Network.getAllCookies", Some(&old_session_id))
-            .await
-            .ok();
-
-        // Create new browser context
-        let ctx_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
-        let context_id = ctx_result
-            .get("browserContextId")
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get browserContextId")?
-            .to_string();
-
-        // Create page in new context
-        let create_result: CreateTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
-                None,
-            )
-            .await?;
-
-        let attach_result: AttachToTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: create_result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        let new_session_id = attach_result.session_id.clone();
-        mgr.enable_domains_pub(&new_session_id).await?;
-
-        // Re-apply download behavior to the recording context.
-        // Without this, downloads in the recording context are silently dropped
-        // because Browser.setDownloadBehavior at launch only applies to the default context.
-        if let Some(ref dl_path) = mgr.download_path {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Browser.setDownloadBehavior",
-                    Some(json!({
-                        "behavior": "allow",
-                        "downloadPath": dl_path,
-                        "browserContextId": context_id,
-                        "eventsEnabled": true
-                    })),
-                    None,
-                )
-                .await;
-        }
-
-        // Re-apply HTTPS error ignore to the recording context.
-        // Security.setIgnoreCertificateErrors at launch only applies to the session it was sent on.
-        if mgr.ignore_https_errors {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Security.setIgnoreCertificateErrors",
-                    Some(json!({ "ignore": true })),
-                    Some(&new_session_id),
-                )
-                .await;
-        }
-
-        // Transfer cookies to new context
-        if let Some(ref cr) = cookies_result {
-            if let Some(cookie_arr) = cr.get("cookies").and_then(|v| v.as_array()) {
-                if !cookie_arr.is_empty() {
-                    let _ = mgr
-                        .client
-                        .send_command(
-                            "Network.setCookies",
-                            Some(json!({ "cookies": cookie_arr })),
-                            Some(&new_session_id),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Add page and switch to it
-        let tab_id = mgr.assign_tab_id();
-        mgr.add_page(super::browser::PageInfo {
-            tab_id,
-            label: None,
-            target_id: create_result.target_id,
-            session_id: new_session_id.clone(),
-            url: nav_url.clone(),
-            title: String::new(),
-            target_type: "page".to_string(),
-        });
 
         if let Some((w, h, scale, mobile)) = viewport {
             let _ = mgr.set_viewport(w, h, scale, mobile).await;
         }
 
-        // Navigate to URL
-        if nav_url != "about:blank" {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Page.navigate",
-                    Some(json!({ "url": nav_url })),
-                    Some(&new_session_id),
-                )
-                .await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        }
-
-        (mgr.client.clone(), new_session_id, context_id)
+        (mgr.client.clone(), mgr.active_session_id()?.to_string())
     };
-
-    let compositor = if demo_capture {
-        let (width, height, scale, mobile) =
-            recording_compositor::viewport_for_session(&client, &new_session_id, state.viewport)
-                .await;
-        Some(
-            RecordingCompositor::create(
-                client.clone(),
-                Some(&browser_context_id),
-                width,
-                height,
-                scale,
-                mobile,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    let (effects_client, effects_session_id) = compositor
-        .as_ref()
-        .map(|c| (c.client.clone(), c.session_id.clone()))
-        .unwrap_or_else(|| (client.clone(), new_session_id.clone()));
 
     setup_recording_effects(
         state,
         effects_config,
-        effects_client,
-        effects_session_id,
-        compositor.is_some(),
+        client.clone(),
+        session_id.clone(),
+        false,
     )
     .await?;
+
+    if let Some(url) = recording_url {
+        state
+            .ref_map
+            .clear_with_reason(Some("recording start navigate"));
+        state.iframe_sessions.clear();
+        state.active_frame_id = None;
+        state
+            .browser
+            .as_mut()
+            .ok_or("Browser not launched")?
+            .navigate(&url, WaitUntil::Load)
+            .await?;
+    }
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
     if demo_capture {
         state.recording_state.capture_gate =
             Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
     }
-    if let Some(compositor) = compositor {
-        state
-            .start_compositor_recording_task(client, new_session_id, compositor)
-            .await?;
-    } else {
-        state.start_recording_task(client, new_session_id).await?;
-    }
+    state.start_recording_task(client, session_id).await?;
     if demo_capture {
         state
             .activate_demo_recording_for(std::time::Duration::from_millis(
@@ -5072,15 +4891,11 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         None
     };
 
-    let recording_target = if let Some(ref mut browser) = state.browser {
-        if let Some(url) = recording_url {
-            browser.navigate(&url, WaitUntil::Load).await?;
-        }
-        let session_id = browser.active_session_id()?.to_string();
-        Some((browser.client.clone(), session_id))
-    } else {
-        None
-    };
+    let recording_target = state.browser.as_ref().map(|browser| {
+        browser
+            .active_session_id()
+            .map(|session_id| (browser.client.clone(), session_id.to_string()))
+    });
 
     recording::recording_start(&mut state.recording_state, path)?;
     if demo_capture {
@@ -5088,39 +4903,31 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
             Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
     }
 
-    if let Some((client, session_id)) = recording_target {
-        let compositor = if demo_capture {
-            let (width, height, scale, mobile) =
-                recording_compositor::viewport_for_session(&client, &session_id, state.viewport)
-                    .await;
-            Some(
-                RecordingCompositor::create(client.clone(), None, width, height, scale, mobile)
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let (effects_client, effects_session_id) = compositor
-            .as_ref()
-            .map(|c| (c.client.clone(), c.session_id.clone()))
-            .unwrap_or_else(|| (client.clone(), session_id.clone()));
-
+    if let Some((client, session_id)) = recording_target.transpose()? {
         setup_recording_effects(
             state,
             effects_config,
-            effects_client,
-            effects_session_id,
-            compositor.is_some(),
+            client.clone(),
+            session_id.clone(),
+            false,
         )
         .await?;
 
-        if let Some(compositor) = compositor {
+        if let Some(url) = recording_url {
             state
-                .start_compositor_recording_task(client, session_id, compositor)
+                .ref_map
+                .clear_with_reason(Some("recording restart navigate"));
+            state.iframe_sessions.clear();
+            state.active_frame_id = None;
+            state
+                .browser
+                .as_mut()
+                .ok_or("Browser not launched")?
+                .navigate(&url, WaitUntil::Load)
                 .await?;
-        } else {
-            state.start_recording_task(client, session_id).await?;
         }
+
+        state.start_recording_task(client, session_id).await?;
         if demo_capture {
             state
                 .activate_demo_recording_for(std::time::Duration::from_millis(
@@ -5206,12 +5013,6 @@ async fn clear_recording_effects(state: &mut DaemonState) {
         let _ = handle.cleanup().await;
     }
     state.recording_effects = None;
-    if let Some(compositor) = state.recording_compositor.take() {
-        state
-            .recording_internal_target_ids
-            .remove(&compositor.target_id);
-        compositor.close().await;
-    }
     state.recording_state.stop_post_roll = std::time::Duration::ZERO;
 }
 

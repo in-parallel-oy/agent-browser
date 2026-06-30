@@ -20,11 +20,11 @@ agent-browser open
 agent-browser record start ./demo.webm https://example.com
 ```
 
-If no URL is provided, recording starts from the current page. The recording context copies cookies from the active session.
+If no URL is provided, recording starts from the current page. If a URL is provided, the active page navigates there before recording starts. Recording uses the current live page directly, so cookies, storage, service workers, and in-page animations stay intact.
 
 ## Recording effects
 
-The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. The default cursor preset renders effects in the recorded page. Demo mode records a stable compositor surface so cursor, overlay, spotlight, and zoom animations remain independent of page navigation. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing with the cursor visible between actions, animated input, blocking visual clicks, and automatic pauses between actions so agent inference delays do not create idle video. Add zoom and overlay emphasis explicitly.
+The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page and registered for future documents while recording is active, so they come back after navigation. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing with the cursor visible between actions, animated input, blocking visual clicks, and automatic pauses between actions so agent inference delays do not create idle video. Add zoom and overlay emphasis explicitly.
 
 The default `--cursor-motion auto` renders the cursor while effects are active. Demo mode uses `always` unless you pass an explicit cursor motion flag.
 
@@ -113,7 +113,7 @@ Screenshots and videos work well together: screenshots capture precise still sta
     <tr><td>Container</td><td>WebM</td></tr>
     <tr><td>Common extension</td><td><code>.webm</code></td></tr>
     <tr><td>Viewport</td><td>Uses the active browser viewport settings</td></tr>
-    <tr><td>State</td><td>Copies cookies from the active session</td></tr>
+    <tr><td>State</td><td>Uses the current live page and preserves browser state</td></tr>
   </tbody>
 </table>
 

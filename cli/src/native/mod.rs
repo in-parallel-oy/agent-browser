@@ -29,8 +29,6 @@ pub mod react;
 #[allow(dead_code)]
 pub mod recording;
 #[allow(dead_code)]
-pub mod recording_compositor;
-#[allow(dead_code)]
 pub mod recording_effects;
 #[allow(dead_code)]
 pub mod screenshot;

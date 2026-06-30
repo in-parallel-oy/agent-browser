@@ -2425,8 +2425,9 @@ Usage: agent-browser record start <path.webm> [url] [effect flags]
        agent-browser record zoom reset
 
 Record the browser to a WebM video file.
-Creates a fresh browser context but preserves cookies and localStorage.
-If no URL is provided, automatically navigates to your current page.
+Records the current live page directly, preserving browser state and in-page
+animation. If a URL is provided, the active page navigates there before
+recording starts.
 
 Operations:
   start <path> [url]     Start recording (defaults to current URL if omitted)
@@ -2454,9 +2455,8 @@ Cursor (rendered by the browser into captured video frames):
 
 Click records cursor flight plus click ripple only. Use explicit `record zoom`
 and `record overlay` commands for presentation emphasis. The default cursor
-preset renders effects in the recorded page. Demo mode records a stable
-compositor surface so cursor, overlay, spotlight, and zoom animations remain
-independent of page navigation.
+preset renders effects in the recorded page. Effects are registered for future
+documents while recording is active, so they come back after navigation.
 Text overlays serialize, stay visible for --duration-ms, and auto-dismiss
 before the next command continues. Spotlight stays visible for --duration-ms;
 selector targets derive radius from the target box, and any target can pass

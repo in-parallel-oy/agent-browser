@@ -367,6 +367,7 @@ impl std::fmt::Debug for RecordingEffectsTarget {
 pub struct RecordingEffectsState {
     config: RecordingEffectsConfig,
     target: Option<RecordingEffectsTarget>,
+    init_script_identifier: Option<String>,
     overlay_chain_until: Option<Instant>,
     effect_active_until: Option<Instant>,
     runtime_installed: bool,
@@ -379,6 +380,7 @@ impl RecordingEffectsState {
         Self {
             config,
             target: None,
+            init_script_identifier: None,
             overlay_chain_until: None,
             effect_active_until: None,
             runtime_installed: false,
@@ -421,11 +423,24 @@ impl RecordingEffectsState {
             if self.runtime_installed {
                 runtime.configure().await?;
             } else {
+                self.init_script_identifier = runtime.install_for_new_documents().await.ok();
                 runtime.install().await?;
                 self.runtime_installed = true;
             }
         }
         Ok(())
+    }
+
+    pub async fn cleanup(&mut self) -> Result<(), String> {
+        let Some(runtime) = self.runtime() else {
+            return Ok(());
+        };
+        let cleanup_result = runtime.cleanup().await;
+        if let Some(identifier) = self.init_script_identifier.take() {
+            let _ = runtime.remove_new_document_script(&identifier).await;
+        }
+        self.runtime_installed = false;
+        cleanup_result
     }
 
     fn runtime(&self) -> Option<RecordingEffectsRuntime> {
@@ -548,10 +563,47 @@ struct RecordingEffectsRuntime {
 }
 
 impl RecordingEffectsRuntime {
-    async fn install(&self) -> Result<(), String> {
-        self.evaluate(RECORDING_EFFECTS_RUNTIME_JS.to_string())
+    fn config_json(&self) -> Value {
+        recording_effects_config_json(&self.config)
+    }
+
+    fn install_source(&self) -> String {
+        recording_effects_install_source(&self.config)
+    }
+
+    async fn install_for_new_documents(&self) -> Result<String, String> {
+        let result: Value = self
+            .target
+            .client
+            .send_command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                Some(json!({ "source": self.install_source() })),
+                Some(&self.target.session_id),
+            )
             .await?;
-        self.configure().await
+        result
+            .get("identifier")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| {
+                "Page.addScriptToEvaluateOnNewDocument returned no identifier".to_string()
+            })
+    }
+
+    async fn remove_new_document_script(&self, identifier: &str) -> Result<(), String> {
+        self.target
+            .client
+            .send_command(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                Some(json!({ "identifier": identifier })),
+                Some(&self.target.session_id),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn install(&self) -> Result<(), String> {
+        self.evaluate(self.install_source()).await
     }
 
     async fn cleanup(&self) -> Result<(), String> {
@@ -563,25 +615,11 @@ impl RecordingEffectsRuntime {
     }
 
     async fn configure(&self) -> Result<(), String> {
-        let Some(cursor) = self.config.cursor.as_ref() else {
-            return self
-                .evaluate(runtime_async_call(
-                    "configure({ cursor: null })".to_string(),
-                ))
-                .await;
-        };
-        let config = json!({
-            "cursor": {
-                "theme": cursor.theme.as_str(),
-                "size": cursor.size_px,
-                "tweenMs": cursor.effective_tween_ms(),
-                "clickMs": cursor.click_ms,
-                "motion": cursor.motion.as_str(),
-                "clickSync": cursor.click_sync.as_str(),
-            }
-        });
-        self.evaluate(runtime_async_call(format!("configure({})", config)))
-            .await
+        self.evaluate(runtime_async_call(format!(
+            "configure({})",
+            self.config_json()
+        )))
+        .await
     }
 
     async fn move_to(&self, x: f64, y: f64) -> Result<(), String> {
@@ -707,6 +745,30 @@ impl RecordingEffectsRuntime {
         }
         Ok(())
     }
+}
+
+fn recording_effects_config_json(config: &RecordingEffectsConfig) -> Value {
+    let Some(cursor) = config.cursor.as_ref() else {
+        return json!({ "cursor": null });
+    };
+    json!({
+        "cursor": {
+            "theme": cursor.theme.as_str(),
+            "size": cursor.size_px,
+            "tweenMs": cursor.effective_tween_ms(),
+            "clickMs": cursor.click_ms,
+            "motion": cursor.motion.as_str(),
+            "clickSync": cursor.click_sync.as_str(),
+        }
+    })
+}
+
+fn recording_effects_install_source(config: &RecordingEffectsConfig) -> String {
+    format!(
+        "{}\nwindow.__agentBrowserRecordingEffects.configure({});",
+        RECORDING_EFFECTS_RUNTIME_JS,
+        recording_effects_config_json(config)
+    )
 }
 
 fn is_missing_runtime_error(err: &str) -> bool {
@@ -859,11 +921,7 @@ impl RecordingEffectsHandle {
     }
 
     pub async fn cleanup(&self) -> Result<(), String> {
-        let runtime = self.shared.lock().await.runtime();
-        if let Some(runtime) = runtime {
-            runtime.cleanup().await?;
-        }
-        Ok(())
+        self.shared.lock().await.cleanup().await
     }
 }
 
@@ -889,6 +947,7 @@ fn runtime_async_call(call: String) -> String {
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
   const VERSION = 6;
+  if (window.top !== window) return;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
   const Z = '2147483647';
@@ -1609,11 +1668,53 @@ mod tests {
     fn runtime_script_defines_dom_only_effects() {
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("__agentBrowserRecordingEffects"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-root"));
+        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("window.top !== window"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("initialCursorPoint"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("visualCursorPoint"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("overlayChain"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-click"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-spotlight"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("composite_frame"));
+    }
+
+    #[test]
+    fn persistent_install_source_applies_demo_cursor_config() {
+        let cfg = RecordingEffectsConfig::from_cmd(
+            RecordEffectsPreset::Demo,
+            Some(&json!({ "theme": "hand", "size": 36 })),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let source = recording_effects_install_source(&cfg);
+
+        assert!(source.contains(RECORDING_EFFECTS_RUNTIME_JS));
+        assert!(source.contains("window.__agentBrowserRecordingEffects.configure"));
+        assert!(source.contains("\"theme\":\"hand\""));
+        assert!(source.contains("\"size\":36"));
+        assert!(source.contains("\"tweenMs\":700"));
+        assert!(source.contains("\"clickMs\":500"));
+        assert!(source.contains("\"motion\":\"always\""));
+        assert!(source.contains("\"clickSync\":\"block\""));
+    }
+
+    #[test]
+    fn persistent_install_source_can_disable_cursor() {
+        let cfg = RecordingEffectsConfig::from_cmd(
+            RecordEffectsPreset::Cursor,
+            Some(&json!({ "theme": "off" })),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let source = recording_effects_install_source(&cfg);
+
+        assert!(source.contains("configure({\"cursor\":null})"));
     }
 }
