@@ -2436,7 +2436,7 @@ Operations:
 Recording Effects:
   --record-effects <preset>   cursor (default), demo, or off; legacy preset alias
   --record-mode <mode>        automation (default) or demo
-                              demo uses slower cursor timing, blocks clicks, and animates fill/type
+                              demo keeps cursor visible, slows timing, blocks clicks, and animates fill/type
 
 Cursor (rendered by the browser into captured video frames):
   --no-cursor                Disable all synthetic effects
@@ -2460,7 +2460,12 @@ overlay may appear; the visible overlay remains until replaced or cleared.
 Spotlight fades out after --duration-ms.
 Zoom holds until reset unless you pass --duration-ms for a temporary zoom.
 Demo mode defaults to a 700 ms cursor tween and 500 ms click ripple unless
-you pass explicit cursor timing flags.
+you pass explicit cursor timing flags. It keeps the cursor visible unless
+you pass --cursor-motion auto or off.
+For compact demos, open and settle the page before recording when initial
+load is not part of the story, then put the recorded sequence in one
+batch --bail command. Recording preserves wall-clock time, so seconds spent
+between separate shell commands become seconds of idle video.
 Tuning flags imply the default `arrow` theme when used without `--cursor`.
 `--cursor` and `--no-cursor` together is a parse error.
 

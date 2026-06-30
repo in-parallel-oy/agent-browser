@@ -820,7 +820,7 @@ agent-browser snapshot -i -c -d 5         # Combine options
 
 ## Video Recording
 
-The `record` command captures browser automation as WebM video. The default `cursor` effects preset renders a synthetic cursor because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders the cursor, click burst, overlays, and zoom with normal SVG, CSS, and text anti-aliasing before each frame is captured. Use `--record-mode demo` for presentation timing defaults: cursor movement and click pulses are slower, clicks wait for the cursor tween, and fill/type actions animate with a short per-character delay. Zoom and overlay effects are explicit commands so normal clicks remain cursor flight plus click ripple only.
+The `record` command captures browser automation as WebM video. The default `cursor` effects preset renders a synthetic cursor because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders the cursor, click burst, overlays, and zoom with normal SVG, CSS, and text anti-aliasing before each frame is captured. Use `--record-mode demo` for presentation timing defaults: cursor movement and click pulses are slower, the cursor stays visible between actions, clicks wait for the cursor tween, and fill/type actions animate with a short per-character delay. Zoom and overlay effects are explicit commands so normal clicks remain cursor flight plus click ripple only.
 
 ```bash
 agent-browser open https://app.example.com
@@ -835,6 +835,8 @@ agent-browser record stop
 ```
 
 Use `--record-effects off` or `--no-cursor` for a clean recording without synthetic effects. Use `--cursor off` to keep explicit zoom/overlay effects available while hiding the cursor. Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, and `--duration-ms` controls when the next queued overlay may appear; the visible overlay remains until replaced or cleared. Spotlight fades out after `--duration-ms`. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. Existing cursor tuning flags such as `--cursor dot`, `--cursor-tween-ms`, and `--cursor-click-ms` still work for advanced cursor styling, and explicit timing flags override the slower demo defaults. The default `--cursor-motion auto` renders the cursor during effect activity; use `--cursor-motion always` when you want the cursor to remain visible while idle.
+
+For compact demos, open and settle the page before recording when initial load is not part of the story, then run the recorded sequence through one `batch --bail` call. Recording preserves wall-clock time, so seconds spent between separate shell commands become seconds of idle video.
 
 ## Annotated Screenshots
 

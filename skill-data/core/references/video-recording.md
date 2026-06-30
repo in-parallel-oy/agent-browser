@@ -77,7 +77,7 @@ agent-browser record start ./demo.webm \
 | Flag                       | Default | Description                                                |
 |----------------------------|---------|------------------------------------------------------------|
 | `--record-effects <preset>` | cursor | Legacy preset alias: `cursor`, `demo`, or `off`. |
-| `--record-mode <mode>`     | automation | `automation` or `demo`. `demo` uses slower cursor timing, blocks click timing, and animates fill/type. |
+| `--record-mode <mode>`     | automation | `automation` or `demo`. `demo` keeps the cursor visible, uses slower cursor timing, blocks click timing, and animates fill/type. |
 | `--no-cursor`              | (off)   | Compatibility alias for `--record-effects off`. Cannot be combined with `--cursor`. |
 | `--cursor <theme>`         | `arrow` | `arrow`, `dot`, `hand`, or `off`. Override the default theme or hide the cursor while keeping explicit effects available. |
 | `--cursor-tween-ms <n>`    | 250     | Duration of the cursor's animated path between targets. Demo mode defaults to 700 unless explicitly set. |
@@ -108,6 +108,8 @@ Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` v
 By default the tween fires in parallel with the click (no added click latency). At 30 fps capture, a 250 ms tween shows up across multiple frames so the cursor visibly travels and lands as the click registers. When strict visual fidelity matters more than click timing, pass `--click-sync block` or use `--record-mode demo`.
 
 The `demo` mode keeps page behavior unchanged except for intentional action timing: cursor flight and click pulses are slower, clicks wait for the cursor tween, and fill/type use animated input defaults. Spotlight, text overlay, cursor, ripple, and zoom are browser-rendered recording effects, so the video captures the same smooth animations Chromium paints on the page.
+
+For compact demos, open and settle the page before recording when initial load is not part of the story, then run the recorded sequence through one `batch --bail` command. Recording preserves wall-clock time, so seconds spent between separate shell commands become seconds of idle video.
 
 ### Limits
 

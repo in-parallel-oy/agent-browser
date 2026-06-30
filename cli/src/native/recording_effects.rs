@@ -293,6 +293,9 @@ impl RecordingEffectsConfig {
                 if cursor_obj.is_none_or(|obj| !obj.contains_key("clickMs")) {
                     cfg.click_ms = 500;
                 }
+                if cursor_obj.is_none_or(|obj| !obj.contains_key("motion")) {
+                    cfg.motion = MotionMode::Always;
+                }
             }
             if let Some(v) = click_sync {
                 cfg.click_sync = ClickSync::from_str(v)?;
@@ -878,6 +881,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let cursorPath = null;
   let cursorPoint = null;
   let cursorAnimation = null;
+  let cursorMoveGeneration = 0;
   let cursorVisible = false;
   let overlayChain = Promise.resolve();
   let overlayGeneration = 0;
@@ -997,7 +1001,28 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     }
   }
 
+  function idleCursorPoint() {
+    const size = Math.max(8, Math.min(96, Number(config.cursor?.size) || 28));
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+    const margin = Math.max(36, size * .9);
+    return { x: margin, y: Math.max(margin, vh - margin) };
+  }
+
+  function ensureVisibleCursor() {
+    if (!config.cursor || config.cursor.motion !== 'always') return;
+    const el = ensureCursor();
+    if (!el) return;
+    updateCursorShape();
+    const point = cursorPoint || idleCursorPoint();
+    cursorPoint = point;
+    cursorVisible = true;
+    el.style.opacity = '1';
+    el.style.transform = cursorTransform(point);
+  }
+
   function initialCursorPoint(to) {
+    if (config.cursor?.motion === 'always') return idleCursorPoint();
     const size = Math.max(8, Math.min(96, Number(config.cursor?.size) || 28));
     const vw = window.innerWidth || document.documentElement.clientWidth || 1;
     const vh = window.innerHeight || document.documentElement.clientHeight || 1;
@@ -1015,6 +1040,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     const to = { x: Number(x) || 0, y: Number(y) || 0 };
     const from = visualCursorPoint() || initialCursorPoint(to);
     const duration = Math.max(0, Number(options.durationMs ?? config.cursor.tweenMs) || 0);
+    const generation = ++cursorMoveGeneration;
     cursorVisible = true;
     cursorAnimation?.cancel();
     if (duration === 0) {
@@ -1036,6 +1062,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       cursorAnimation.finished.catch(() => {}),
       new Promise(resolve => setTimeout(resolve, duration)),
     ]);
+    if (generation !== cursorMoveGeneration) return;
     el.style.opacity = '1';
     el.style.transform = cursorTransform(to);
     cursorPoint = to;
@@ -1319,6 +1346,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     cursorPath = null;
     cursorPoint = null;
     cursorAnimation = null;
+    cursorMoveGeneration += 1;
     cursorVisible = false;
     overlayGeneration += 1;
     overlayChain = Promise.resolve();
@@ -1332,6 +1360,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       if (nextConfig.cursor === null) config.cursor = null;
       else config.cursor = { ...defaultConfig.cursor, ...(nextConfig.cursor || {}) };
       updateCursorShape();
+      ensureVisibleCursor();
     },
     moveTo,
     click,
@@ -1384,6 +1413,7 @@ mod tests {
         assert_eq!(cfg.input_mode, InputMode::Animated);
         let cursor = cfg.cursor.unwrap();
         assert_eq!(cursor.click_sync, ClickSync::Block);
+        assert_eq!(cursor.motion, MotionMode::Always);
         assert_eq!(cursor.tween_ms, 700);
         assert_eq!(cursor.click_ms, 500);
     }

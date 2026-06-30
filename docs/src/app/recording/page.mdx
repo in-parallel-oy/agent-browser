@@ -24,9 +24,9 @@ If no URL is provided, recording starts from the current page. The recording con
 
 ## Recording effects
 
-The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders cursor SVGs, click bursts, overlays, and zoom animations before each frame is captured. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing, then add zoom and overlay emphasis explicitly.
+The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders cursor SVGs, click bursts, overlays, and zoom animations before each frame is captured. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing with the cursor visible between actions, then add zoom and overlay emphasis explicitly.
 
-The default `--cursor-motion auto` renders the cursor while effects are active. Use `--cursor-motion always` when idle cursor visibility matters.
+The default `--cursor-motion auto` renders the cursor while effects are active. Demo mode uses `always` unless you pass an explicit cursor motion flag.
 
 ```bash
 agent-browser record start ./demo.webm --record-mode demo
