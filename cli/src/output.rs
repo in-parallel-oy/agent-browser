@@ -2453,9 +2453,10 @@ Cursor (rendered by the browser into captured video frames):
   --input-delay-ms <n>       Delay between typed characters when animated
 
 Click records cursor flight plus click ripple only. Use explicit `record zoom`
-and `record overlay` commands for presentation emphasis. Recording effects
-are injected into the recorded page so Chromium renders smooth SVG, CSS, and
-text animations before each frame is captured.
+and `record overlay` commands for presentation emphasis. The default cursor
+preset renders effects in the recorded page. Demo mode records a stable
+compositor surface so cursor, overlay, spotlight, and zoom animations remain
+independent of page navigation.
 Text overlays serialize and auto-dismiss after --duration-ms.
 Spotlight fades out after --duration-ms; selector targets derive radius from
 the target box, and any target can pass --radius to override it.

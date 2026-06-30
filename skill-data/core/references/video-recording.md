@@ -48,7 +48,7 @@ agent-browser record restart ./take2.webm
 
 ## Recording Effects
 
-The OS cursor is never visible in `record start` output because CDP `Page.captureScreenshot` renders the page DOM only, with no OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. Effects are injected into the recorded page, so Chromium renders anti-aliased SVG, CSS, and text animations before each frame is captured. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
+The OS cursor is never visible in `record start` output because CDP `Page.captureScreenshot` renders the page DOM only, with no OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. The default cursor preset renders effects in the recorded page. Demo mode records a stable compositor surface so cursor, overlay, spotlight, and zoom animations remain independent of page navigation. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
 
 ```bash
 # Default: arrow cursor, 250ms tween, 400ms click ripple, 28px

@@ -79,14 +79,14 @@ impl RecordingCaptureGate {
         self.notify.notify_one();
     }
 
-    async fn is_active(&self) -> bool {
+    pub(crate) async fn is_active(&self) -> bool {
         self.active_until
             .lock()
             .await
             .is_some_and(|until| until > Instant::now())
     }
 
-    async fn wait_until_active(&self) {
+    pub(crate) async fn wait_until_active(&self) {
         loop {
             if self.is_active().await {
                 return;
@@ -156,7 +156,7 @@ pub fn recording_restart(state: &mut RecordingState, path: &str) -> Result<Value
     }))
 }
 
-fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command {
+pub(crate) fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("ffmpeg");
 
     cmd.args(["-y"])
@@ -197,14 +197,19 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
     cmd
 }
 
-fn capture_interval(fps: u32) -> Duration {
+pub(crate) fn capture_interval(fps: u32) -> Duration {
     // Round down because if fps doesn't divide evenly, we'd rather capture
     // slightly faster than the declared rate.
     let fps = fps.max(1) as u64;
     Duration::from_millis(1000 / fps)
 }
 
-fn due_frame_count(started_at: Instant, now: Instant, fps: u32, frames_written: u64) -> u64 {
+pub(crate) fn due_frame_count(
+    started_at: Instant,
+    now: Instant,
+    fps: u32,
+    frames_written: u64,
+) -> u64 {
     let elapsed = now
         .checked_duration_since(started_at)
         .unwrap_or(Duration::ZERO);

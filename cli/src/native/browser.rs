@@ -96,8 +96,11 @@ fn is_internal_chrome_target(url: &str) -> bool {
         || url.starts_with("devtools://")
 }
 
+pub(crate) const RECORDING_COMPOSITOR_URL: &str = "about:blank#agent-browser-recording-compositor";
+
 pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
     (target.target_type == "page" || target.target_type == "webview")
+        && target.url != RECORDING_COMPOSITOR_URL
         && (target.url.is_empty() || !is_internal_chrome_target(&target.url))
 }
 
@@ -1812,6 +1815,20 @@ mod tests {
             target_type: "page".to_string(),
             title: "New Tab".to_string(),
             url: "chrome://newtab/".to_string(),
+            attached: None,
+            browser_context_id: None,
+        };
+
+        assert!(!should_track_target(&target));
+    }
+
+    #[test]
+    fn test_should_not_track_recording_compositor_target() {
+        let target = TargetInfo {
+            target_id: "recording-compositor".to_string(),
+            target_type: "page".to_string(),
+            title: String::new(),
+            url: RECORDING_COMPOSITOR_URL.to_string(),
             attached: None,
             browser_context_id: None,
         };
