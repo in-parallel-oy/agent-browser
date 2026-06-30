@@ -2895,36 +2895,57 @@ fn call_record_overlay(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
+fn append_record_target_args(
+    arguments: &Value,
+    args: &mut Vec<String>,
+    context: &str,
+) -> Result<(), ProtocolError> {
+    let x = optional_number_string(arguments, "x")?;
+    let y = optional_number_string(arguments, "y")?;
+    if let Some(selector) = optional_string(arguments, "selector")? {
+        if x.is_some() || y.is_some() {
+            return Err(ProtocolError::invalid_params(format!(
+                "{} accepts either selector or x/y, not both",
+                context
+            )));
+        }
+        args.push(selector);
+    } else if let (Some(x), Some(y)) = (x, y) {
+        args.push("--x".to_string());
+        args.push(x);
+        args.push("--y".to_string());
+        args.push(y);
+    } else {
+        return Err(ProtocolError::invalid_params(format!(
+            "{} requires selector or both x and y",
+            context
+        )));
+    }
+    Ok(())
+}
+
 fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let kind = required_string(arguments, "kind")?;
     let mut args = vec!["record".to_string(), "overlay".to_string(), kind.clone()];
     match kind.as_str() {
-        "text" => args.push(required_string(arguments, "text")?),
+        "text" => {
+            if arguments.get("selector").is_some()
+                || arguments.get("x").is_some()
+                || arguments.get("y").is_some()
+            {
+                return Err(ProtocolError::invalid_params(
+                    "record_overlay kind=text does not accept selector, x, or y",
+                ));
+            }
+            args.push(required_string(arguments, "text")?);
+        }
         "spotlight" => {
             if arguments.get("position").is_some() {
                 return Err(ProtocolError::invalid_params(
                     "position is only valid for record_overlay kind=text",
                 ));
             }
-            let x = optional_number_string(arguments, "x")?;
-            let y = optional_number_string(arguments, "y")?;
-            if let Some(selector) = optional_string(arguments, "selector")? {
-                if x.is_some() || y.is_some() {
-                    return Err(ProtocolError::invalid_params(
-                        "record_overlay kind=spotlight accepts either selector or x/y, not both",
-                    ));
-                }
-                args.push(selector);
-            } else if let (Some(x), Some(y)) = (x, y) {
-                args.push("--x".to_string());
-                args.push(x);
-                args.push("--y".to_string());
-                args.push(y);
-            } else {
-                return Err(ProtocolError::invalid_params(
-                    "record_overlay kind=spotlight requires selector or both x and y",
-                ));
-            }
+            append_record_target_args(arguments, &mut args, "record_overlay kind=spotlight")?;
         }
         "clear" => {
             if arguments.get("text").is_some()
@@ -2965,25 +2986,7 @@ fn record_zoom_args_from_arguments(arguments: &Value) -> Result<Vec<String>, Pro
     let mut args = vec!["record".to_string(), "zoom".to_string(), mode.clone()];
     match mode.as_str() {
         "to" => {
-            let x = optional_number_string(arguments, "x")?;
-            let y = optional_number_string(arguments, "y")?;
-            if let Some(selector) = optional_string(arguments, "selector")? {
-                if x.is_some() || y.is_some() {
-                    return Err(ProtocolError::invalid_params(
-                        "record_zoom mode=to accepts either selector or x/y, not both",
-                    ));
-                }
-                args.push(selector);
-            } else if let (Some(x), Some(y)) = (x, y) {
-                args.push("--x".to_string());
-                args.push(x);
-                args.push("--y".to_string());
-                args.push(y);
-            } else {
-                return Err(ProtocolError::invalid_params(
-                    "record_zoom mode=to requires selector or both x and y",
-                ));
-            }
+            append_record_target_args(arguments, &mut args, "record_zoom mode=to")?;
         }
         "reset" => {
             if arguments.get("selector").is_some()
@@ -3887,6 +3890,19 @@ mod tests {
         let err = record_overlay_args_from_arguments(&json!({
             "kind": "spotlight",
             "selector": "@e4",
+            "x": 640,
+            "y": 360
+        }))
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn record_overlay_text_rejects_coordinates() {
+        let err = record_overlay_args_from_arguments(&json!({
+            "kind": "text",
+            "text": "Hello",
             "x": 640,
             "y": 360
         }))

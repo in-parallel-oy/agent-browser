@@ -18,6 +18,7 @@ pub const DEFAULT_CAPTURE_FPS: u32 = 30;
 const MIN_CAPTURE_FPS: u32 = 1;
 /// Upper bound. Anything higher and CDP captureScreenshot can't keep up.
 const MAX_CAPTURE_FPS: u32 = 60;
+const MAX_CATCH_UP_SECONDS: u64 = 2;
 
 pub struct RecordingState {
     pub active: bool,
@@ -156,7 +157,11 @@ fn due_frame_count(started_at: Instant, now: Instant, fps: u32, frames_written: 
         .checked_duration_since(started_at)
         .unwrap_or(Duration::ZERO);
     let target_frames = (elapsed.as_secs_f64() * fps.max(1) as f64).floor() as u64 + 1;
-    target_frames.saturating_sub(frames_written).max(1)
+    let max_catch_up_frames = fps.max(1) as u64 * MAX_CATCH_UP_SECONDS;
+    target_frames
+        .saturating_sub(frames_written)
+        .max(1)
+        .min(max_catch_up_frames)
 }
 
 /// Spawn a background task that captures screenshots at a fixed interval
@@ -405,6 +410,15 @@ mod tests {
         assert_eq!(
             due_frame_count(started_at, started_at + Duration::from_millis(1000), 30, 16),
             15
+        );
+    }
+
+    #[test]
+    fn test_due_frame_count_caps_long_stall_catch_up() {
+        let started_at = Instant::now();
+        assert_eq!(
+            due_frame_count(started_at, started_at + Duration::from_secs(10), 30, 1),
+            60
         );
     }
 

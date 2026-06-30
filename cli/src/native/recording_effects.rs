@@ -367,6 +367,8 @@ pub struct RecordingEffectsState {
     overlay_chain_until: Option<Instant>,
     effect_active_until: Option<Instant>,
     runtime_installed: bool,
+    pending_move: Option<(f64, f64)>,
+    move_flush_scheduled: bool,
 }
 
 impl RecordingEffectsState {
@@ -377,6 +379,8 @@ impl RecordingEffectsState {
             overlay_chain_until: None,
             effect_active_until: None,
             runtime_installed: false,
+            pending_move: None,
+            move_flush_scheduled: false,
         }
     }
 
@@ -432,6 +436,7 @@ impl RecordingEffectsState {
             return Duration::ZERO;
         };
         self.move_to(x, y);
+        self.pending_move = None;
         let now = Instant::now();
         let tween = Duration::from_millis(cursor_cfg.effective_tween_ms() as u64);
         let click_duration = Duration::from_millis(cursor_cfg.click_ms.max(1) as u64);
@@ -566,25 +571,25 @@ impl RecordingEffectsRuntime {
     }
 
     async fn move_to(&self, x: f64, y: f64) -> Result<(), String> {
-        self.evaluate(runtime_async_call(format!(
+        self.evaluate_runtime_call(format!(
             "moveTo({}, {})",
             finite_js_number(x),
             finite_js_number(y)
-        )))
+        ))
         .await
     }
 
     async fn click(&self, x: f64, y: f64) -> Result<(), String> {
-        self.evaluate(runtime_async_call(format!(
+        self.evaluate_runtime_call(format!(
             "click({}, {})",
             finite_js_number(x),
             finite_js_number(y)
-        )))
+        ))
         .await
     }
 
     async fn key(&self, label: &str) -> Result<(), String> {
-        self.evaluate(runtime_async_call(format!("key({})", js_string(label))))
+        self.evaluate_runtime_call(format!("key({})", js_string(label)))
             .await
     }
 
@@ -594,27 +599,27 @@ impl RecordingEffectsRuntime {
         position: OverlayPosition,
         duration_ms: u64,
     ) -> Result<(), String> {
-        self.evaluate(runtime_async_call(format!(
+        self.evaluate_runtime_call(format!(
             "overlayText({}, {}, {})",
             js_string(text),
             js_string(position.as_str()),
             duration_ms.max(1)
-        )))
+        ))
         .await
     }
 
     async fn spotlight(&self, x: f64, y: f64, duration_ms: u64) -> Result<(), String> {
-        self.evaluate(runtime_async_call(format!(
+        self.evaluate_runtime_call(format!(
             "spotlight({}, {}, {})",
             finite_js_number(x),
             finite_js_number(y),
             duration_ms.max(1)
-        )))
+        ))
         .await
     }
 
     async fn clear_overlay(&self) -> Result<(), String> {
-        self.evaluate(runtime_async_call("clearOverlay()".to_string()))
+        self.evaluate_runtime_call("clearOverlay()".to_string())
             .await
     }
 
@@ -628,19 +633,29 @@ impl RecordingEffectsRuntime {
         let duration = duration_ms
             .map(|ms| ms.max(1).to_string())
             .unwrap_or_else(|| "null".to_string());
-        self.evaluate(runtime_async_call(format!(
+        self.evaluate_runtime_call(format!(
             "zoomTo({}, {}, {}, {})",
             finite_js_number(x),
             finite_js_number(y),
             finite_js_number(scale.clamp(1.0, 3.0)),
             duration
-        )))
+        ))
         .await
     }
 
     async fn zoom_reset(&self) -> Result<(), String> {
-        self.evaluate(runtime_async_call("zoomReset()".to_string()))
-            .await
+        self.evaluate_runtime_call("zoomReset()".to_string()).await
+    }
+
+    async fn evaluate_runtime_call(&self, call: String) -> Result<(), String> {
+        match self.evaluate(runtime_async_call(call.clone())).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_missing_runtime_error(&err) => {
+                self.install().await?;
+                self.evaluate(runtime_async_call(call)).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn evaluate(&self, expression: String) -> Result<(), String> {
@@ -669,6 +684,12 @@ impl RecordingEffectsRuntime {
     }
 }
 
+fn is_missing_runtime_error(err: &str) -> bool {
+    err.contains("__agentBrowserRecordingEffects")
+        || err.contains("Cannot read properties of undefined")
+        || err.contains("Cannot read property")
+}
+
 #[derive(Clone, Debug)]
 pub struct RecordingEffectsHandle {
     pub shared: Arc<Mutex<RecordingEffectsState>>,
@@ -676,13 +697,30 @@ pub struct RecordingEffectsHandle {
 
 impl RecordingEffectsHandle {
     pub async fn move_to(&self, x: f64, y: f64) {
-        let runtime = {
+        let should_schedule = {
             let mut guard = self.shared.lock().await;
             guard.move_to(x, y);
-            guard.runtime()
+            guard.pending_move = Some((x, y));
+            if guard.move_flush_scheduled {
+                false
+            } else {
+                guard.move_flush_scheduled = true;
+                true
+            }
         };
-        if let Some(runtime) = runtime {
-            let _ = runtime.move_to(x, y).await;
+        if should_schedule {
+            let shared = self.shared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                let (runtime, point) = {
+                    let mut guard = shared.lock().await;
+                    guard.move_flush_scheduled = false;
+                    (guard.runtime(), guard.pending_move.take())
+                };
+                if let (Some(runtime), Some((x, y))) = (runtime, point) {
+                    let _ = runtime.move_to(x, y).await;
+                }
+            });
         }
     }
 
@@ -819,7 +857,7 @@ fn runtime_async_call(call: String) -> String {
 
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
-  const VERSION = 4;
+  const VERSION = 5;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
   const Z = '2147483647';
@@ -842,7 +880,9 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let cursorAnimation = null;
   let cursorVisible = false;
   let overlayChain = Promise.resolve();
+  let overlayGeneration = 0;
   let zoomResetTimer = null;
+  let zoomOriginalStyles = null;
   let installedStyle = null;
 
   function ensureRoot() {
@@ -1117,7 +1157,9 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 
   function overlayText(text, position = 'bottom', durationMs = 5000) {
     const previous = overlayChain;
+    const generation = overlayGeneration;
     const shown = previous.then(() => {
+      if (generation !== overlayGeneration) return null;
       root?.querySelectorAll('[data-agent-browser-recording-overlay]').forEach(el => el.remove());
       const el = pill(text, position, 0);
       el.setAttribute('data-agent-browser-recording-overlay', '');
@@ -1201,8 +1243,33 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 
   function clearOverlay() {
     ensureRoot();
+    overlayGeneration += 1;
     root.querySelectorAll('[data-agent-browser-recording-overlay], [data-agent-browser-recording-key], [data-agent-browser-recording-spotlight]').forEach(el => el.remove());
     overlayChain = Promise.resolve();
+  }
+
+  function snapshotZoomStyles() {
+    if (zoomOriginalStyles) return;
+    const body = document.body;
+    if (!body) return;
+    zoomOriginalStyles = {
+      htmlOverflow: document.documentElement.style.overflow,
+      bodyOverflow: body.style.overflow,
+      bodyTransformOrigin: body.style.transformOrigin,
+      bodyTransition: body.style.transition,
+      bodyTransform: body.style.transform,
+    };
+  }
+
+  function restoreZoomStyles() {
+    const body = document.body;
+    if (!body || !zoomOriginalStyles) return;
+    document.documentElement.style.overflow = zoomOriginalStyles.htmlOverflow;
+    body.style.overflow = zoomOriginalStyles.bodyOverflow;
+    body.style.transformOrigin = zoomOriginalStyles.bodyTransformOrigin;
+    body.style.transition = zoomOriginalStyles.bodyTransition;
+    body.style.transform = zoomOriginalStyles.bodyTransform;
+    zoomOriginalStyles = null;
   }
 
   function zoomTo(x, y, scale, durationMs = null) {
@@ -1210,6 +1277,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     clearTimeout(zoomResetTimer);
     const body = document.body;
     if (!body) return;
+    snapshotZoomStyles();
     const vw = window.innerWidth || document.documentElement.clientWidth || 1;
     const vh = window.innerHeight || document.documentElement.clientHeight || 1;
     const cx = Number(x) || 0;
@@ -1239,11 +1307,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
     body.style.transform = '';
     await new Promise(resolve => setTimeout(resolve, 700));
-    body.style.removeProperty('transform');
-    body.style.removeProperty('transform-origin');
-    body.style.removeProperty('transition');
-    body.style.removeProperty('overflow');
-    document.documentElement.style.removeProperty('overflow');
+    restoreZoomStyles();
   }
 
   function cleanup() {
@@ -1256,13 +1320,9 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     cursorPoint = null;
     cursorAnimation = null;
     cursorVisible = false;
+    overlayGeneration += 1;
     overlayChain = Promise.resolve();
-    const body = document.body;
-    body?.style.removeProperty('transform');
-    body?.style.removeProperty('transform-origin');
-    body?.style.removeProperty('transition');
-    body?.style.removeProperty('overflow');
-    document.documentElement.style.removeProperty('overflow');
+    restoreZoomStyles();
   }
 
   window.__agentBrowserRecordingEffects = {

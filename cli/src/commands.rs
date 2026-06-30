@@ -2205,7 +2205,7 @@ fn parse_record_overlay(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 "kind": "text",
                 "text": text,
             });
-            apply_record_overlay_flags(&rest[2..], &mut cmd, true)?;
+            apply_record_overlay_flags(&rest[2..], &mut cmd, true, false)?;
             Ok(cmd)
         }
         "spotlight" => {
@@ -2222,6 +2222,7 @@ fn parse_record_overlay(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 &rest[if target.is_some() { 2 } else { 1 }..],
                 &mut cmd,
                 false,
+                true,
             )?;
             validate_record_point_args(
                 &cmd,
@@ -2249,6 +2250,7 @@ fn apply_record_overlay_flags(
     rest: &[&str],
     cmd: &mut Value,
     allow_position: bool,
+    allow_coordinates: bool,
 ) -> Result<(), ParseError> {
     let mut i = 0;
     while i < rest.len() {
@@ -2293,6 +2295,12 @@ fn apply_record_overlay_flags(
                 i += 2;
             }
             "--x" => {
+                if !allow_coordinates {
+                    return Err(ParseError::InvalidValue {
+                        message: "--x is only valid for record overlay spotlight".to_string(),
+                        usage: "record overlay spotlight --x <number> --y <number>",
+                    });
+                }
                 let v = rest
                     .get(i + 1)
                     .ok_or_else(|| ParseError::MissingArguments {
@@ -2304,6 +2312,12 @@ fn apply_record_overlay_flags(
                 i += 2;
             }
             "--y" => {
+                if !allow_coordinates {
+                    return Err(ParseError::InvalidValue {
+                        message: "--y is only valid for record overlay spotlight".to_string(),
+                        usage: "record overlay spotlight --x <number> --y <number>",
+                    });
+                }
                 let v = rest
                     .get(i + 1)
                     .ok_or_else(|| ParseError::MissingArguments {
@@ -4785,6 +4799,15 @@ mod tests {
         assert_eq!(cmd["text"], "Hello");
         assert_eq!(cmd["position"], "bottom");
         assert_eq!(cmd["durationMs"], 1200);
+    }
+
+    #[test]
+    fn test_record_overlay_text_rejects_coordinates() {
+        let result = parse_command(
+            &args("record overlay text Hello --x 640 --y 360"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
