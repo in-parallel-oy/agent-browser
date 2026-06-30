@@ -2419,7 +2419,7 @@ Usage: agent-browser record start <path.webm> [url] [effect flags]
        agent-browser record stop
        agent-browser record restart <path.webm> [url] [effect flags]
        agent-browser record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]
-       agent-browser record overlay spotlight <selector|ref>|--x <n> --y <n> [--duration-ms <n>]
+       agent-browser record overlay spotlight <selector|ref>|--x <n> --y <n> [--radius <n>] [--duration-ms <n>]
        agent-browser record overlay clear
        agent-browser record zoom to <selector|ref>|--x <n> --y <n> [--scale <n>] [--duration-ms <n>]
        agent-browser record zoom reset
@@ -2436,7 +2436,8 @@ Operations:
 Recording Effects:
   --record-effects <preset>   cursor (default), demo, or off; legacy preset alias
   --record-mode <mode>        automation (default) or demo
-                              demo keeps cursor visible, slows timing, blocks clicks, and animates fill/type
+                              demo keeps cursor visible, slows timing, blocks clicks,
+                              animates fill/type, and skips idle time between actions
 
 Cursor (rendered by the browser into captured video frames):
   --no-cursor                Disable all synthetic effects
@@ -2455,17 +2456,19 @@ Click records cursor flight plus click ripple only. Use explicit `record zoom`
 and `record overlay` commands for presentation emphasis. Recording effects
 are injected into the recorded page so Chromium renders smooth SVG, CSS, and
 text animations before each frame is captured.
-Text overlays serialize, and --duration-ms controls when the next queued
-overlay may appear; the visible overlay remains until replaced or cleared.
-Spotlight fades out after --duration-ms.
+Text overlays serialize and auto-dismiss after --duration-ms.
+Spotlight fades out after --duration-ms; selector targets derive radius from
+the target box, and any target can pass --radius to override it.
 Zoom holds until reset unless you pass --duration-ms for a temporary zoom.
+Recordings are silent; narration, click SFX, and typing SFX are out of scope
+for the screenshot-plus-ffmpeg pipeline.
 Demo mode defaults to a 700 ms cursor tween and 500 ms click ripple unless
 you pass explicit cursor timing flags. It keeps the cursor visible unless
 you pass --cursor-motion auto or off.
 For compact demos, open and settle the page before recording when initial
-load is not part of the story, then put the recorded sequence in one
-batch --bail command. Recording preserves wall-clock time, so seconds spent
-between separate shell commands become seconds of idle video.
+load is not part of the story. Demo mode captures only visual activity and
+pauses between agent/tool calls, so inference delays and bare wait commands
+do not pad the video.
 Tuning flags imply the default `arrow` theme when used without `--cursor`.
 `--cursor` and `--no-cursor` together is a parse error.
 

@@ -611,12 +611,23 @@ impl RecordingEffectsRuntime {
         .await
     }
 
-    async fn spotlight(&self, x: f64, y: f64, duration_ms: u64) -> Result<(), String> {
+    async fn spotlight(
+        &self,
+        x: f64,
+        y: f64,
+        duration_ms: u64,
+        radius: Option<f64>,
+    ) -> Result<(), String> {
+        let radius = radius
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .map(finite_js_number)
+            .unwrap_or_else(|| "null".to_string());
         self.evaluate_runtime_call(format!(
-            "spotlight({}, {}, {})",
+            "spotlight({}, {}, {}, {})",
             finite_js_number(x),
             finite_js_number(y),
-            duration_ms.max(1)
+            duration_ms.max(1),
+            radius
         ))
         .await
     }
@@ -776,14 +787,20 @@ impl RecordingEffectsHandle {
         Ok(())
     }
 
-    pub async fn spotlight(&self, x: f64, y: f64, duration_ms: u64) -> Result<(), String> {
+    pub async fn spotlight(
+        &self,
+        x: f64,
+        y: f64,
+        duration_ms: u64,
+        radius: Option<f64>,
+    ) -> Result<(), String> {
         let runtime = {
             let mut guard = self.shared.lock().await;
             guard.spotlight(x, y, duration_ms);
             guard.runtime()
         };
         if let Some(runtime) = runtime {
-            runtime.spotlight(x, y, duration_ms).await?;
+            runtime.spotlight(x, y, duration_ms, radius).await?;
         }
         Ok(())
     }
@@ -860,7 +877,7 @@ fn runtime_async_call(call: String) -> String {
 
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
-  const VERSION = 5;
+  const VERSION = 6;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
   const Z = '2147483647';
@@ -886,6 +903,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let overlayChain = Promise.resolve();
   let overlayGeneration = 0;
   let zoomResetTimer = null;
+  let zoomGeneration = 0;
   let zoomOriginalStyles = null;
   let installedStyle = null;
 
@@ -1083,43 +1101,39 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     root.appendChild(group);
 
     const rings = [];
-    for (let i = 0; i < 2; i += 1) {
-      const ring = document.createElement('div');
-      ring.style.position = 'absolute';
-      ring.style.left = '-10px';
-      ring.style.top = '-10px';
-      ring.style.width = '20px';
-      ring.style.height = '20px';
-      ring.style.border = i === 0 ? '3px solid rgba(255,255,255,.96)' : '2px solid rgba(118,255,56,.92)';
-      ring.style.borderRadius = '999px';
-      ring.style.background = 'transparent';
-      ring.style.boxShadow = i === 0
-        ? '0 0 0 1px rgba(0,0,0,.55), 0 0 18px rgba(255,255,255,.35)'
-        : '0 0 0 1px rgba(0,0,0,.45), 0 0 24px rgba(118,255,56,.55)';
-      ring.style.transformOrigin = 'center center';
-      group.appendChild(ring);
-      rings.push(ring);
-    }
+    const ring = document.createElement('div');
+    ring.style.position = 'absolute';
+    ring.style.left = '-9px';
+    ring.style.top = '-9px';
+    ring.style.width = '18px';
+    ring.style.height = '18px';
+    ring.style.border = '2px solid rgba(255,255,255,.96)';
+    ring.style.borderRadius = '999px';
+    ring.style.background = 'transparent';
+    ring.style.boxShadow = '0 0 0 1px rgba(0,0,0,.42), 0 0 14px rgba(255,255,255,.26)';
+    ring.style.transformOrigin = 'center center';
+    group.appendChild(ring);
+    rings.push(ring);
 
     const rays = [];
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 6; i += 1) {
       const ray = document.createElement('div');
       ray.style.position = 'absolute';
-      ray.style.width = '16px';
-      ray.style.height = '3px';
+      ray.style.width = '13px';
+      ray.style.height = '2px';
       ray.style.borderRadius = '2px';
-      ray.style.background = i % 2 === 0 ? '#fff' : '#76ff38';
-      ray.style.boxShadow = '0 0 0 1px rgba(0,0,0,.55), 0 0 10px rgba(118,255,56,.60)';
+      ray.style.background = 'rgba(255,255,255,.92)';
+      ray.style.boxShadow = '0 0 0 1px rgba(0,0,0,.38), 0 0 8px rgba(255,255,255,.28)';
       ray.style.transformOrigin = 'center center';
       group.appendChild(ray);
       rays.push(ray);
     }
     rings.forEach((ring, i) => ring.animate(
       [
-        { transform: 'translate(-50%, -50%) scale(.35)', opacity: i === 0 ? .95 : .75 },
-        { transform: `translate(-50%, -50%) scale(${i === 0 ? 3.2 : 4.6})`, opacity: 0 },
+        { transform: 'translate(-50%, -50%) scale(.45)', opacity: .75 },
+        { transform: 'translate(-50%, -50%) scale(2.8)', opacity: 0 },
       ],
-      { duration: ms + i * 120, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
+      { duration: ms, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
     ));
     rays.forEach((ray, i) => {
       const a = (i / rays.length) * Math.PI * 2;
@@ -1129,10 +1143,10 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       ray.animate(
         [
           { transform: `translate(${dx * 12 - 8}px, ${dy * 12 - 1.5}px) rotate(${deg}deg) scaleX(.15)`, opacity: 0 },
-          { transform: `translate(${dx * 24 - 8}px, ${dy * 24 - 1.5}px) rotate(${deg}deg) scaleX(1)`, opacity: 1, offset: .32 },
-          { transform: `translate(${dx * 44 - 8}px, ${dy * 44 - 1.5}px) rotate(${deg}deg) scaleX(.2)`, opacity: 0 },
+          { transform: `translate(${dx * 22 - 8}px, ${dy * 22 - 1}px) rotate(${deg}deg) scaleX(.85)`, opacity: .85, offset: .3 },
+          { transform: `translate(${dx * 36 - 8}px, ${dy * 36 - 1}px) rotate(${deg}deg) scaleX(.2)`, opacity: 0 },
         ],
-        { duration: ms, delay: 35 + i * 18, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
+        { duration: ms, delay: 25 + i * 14, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
       );
     });
     setTimeout(() => group.remove(), ms + 360);
@@ -1185,6 +1199,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   function overlayText(text, position = 'bottom', durationMs = 5000) {
     const previous = overlayChain;
     const generation = overlayGeneration;
+    const ms = Math.max(1, Number(durationMs) || 5000);
     const shown = previous.then(() => {
       if (generation !== overlayGeneration) return null;
       root?.querySelectorAll('[data-agent-browser-recording-overlay]').forEach(el => el.remove());
@@ -1195,7 +1210,15 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       return el;
     });
     overlayChain = shown.then(() => new Promise(resolve => {
-      setTimeout(resolve, Math.max(1, Number(durationMs) || 5000));
+      setTimeout(() => {
+        if (generation === overlayGeneration) {
+          root?.querySelectorAll('[data-agent-browser-recording-overlay]').forEach(el => {
+            el.style.opacity = '0';
+            setTimeout(() => el.remove(), 180);
+          });
+        }
+        resolve();
+      }, ms);
     })).catch(() => {});
     return shown.then(() => undefined);
   }
@@ -1232,35 +1255,49 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     }, 850);
   }
 
-  function spotlight(x, y, durationMs = 1200) {
+  function spotlight(x, y, durationMs = 1200, radius = null) {
     ensureRoot();
     root.querySelectorAll('[data-agent-browser-recording-spotlight]').forEach(el => el.remove());
     const el = document.createElement('div');
     el.setAttribute('data-agent-browser-recording-spotlight', '');
     const px = Number(x) || 0;
     const py = Number(y) || 0;
+    const r = Math.max(36, Math.min(320, Number(radius) || 72));
+    const soft = Math.round(r * 1.7);
+    const outer = Math.round(r * 3.0);
     Object.assign(el.style, {
       position: 'absolute',
       inset: '0',
-      background: `radial-gradient(circle at ${px}px ${py}px, rgba(118,255,56,.18) 0, rgba(118,255,56,.10) 64px, rgba(0,0,0,.18) 128px, rgba(0,0,0,.52) 240px)`,
+      background: `radial-gradient(circle at ${px}px ${py}px, rgba(118,255,56,.14) 0, rgba(118,255,56,.08) ${r}px, rgba(0,0,0,.16) ${soft}px, rgba(0,0,0,.50) ${outer}px)`,
       opacity: '0',
-      transition: 'opacity 180ms ease',
+      transition: 'opacity 220ms ease',
       zIndex: '20',
     });
     const ring = document.createElement('div');
     Object.assign(ring.style, {
       position: 'absolute',
-      left: `${px - 72}px`,
-      top: `${py - 72}px`,
-      width: '144px',
-      height: '144px',
-      border: '3px solid rgba(118,255,56,.98)',
+      left: `${px - r}px`,
+      top: `${py - r}px`,
+      width: `${r * 2}px`,
+      height: `${r * 2}px`,
+      border: '2px solid rgba(118,255,56,.92)',
       borderRadius: '999px',
-      boxShadow: '0 0 0 2px rgba(0,0,0,.55), 0 0 36px rgba(118,255,56,.72), inset 0 0 24px rgba(118,255,56,.28)',
+      boxShadow: '0 0 0 1px rgba(0,0,0,.45), 0 0 26px rgba(118,255,56,.52), inset 0 0 18px rgba(118,255,56,.20)',
+      transform: 'scale(.94)',
+      opacity: '0',
     });
     el.appendChild(ring);
     root.appendChild(el);
-    requestAnimationFrame(() => { el.style.opacity = '1'; });
+    requestAnimationFrame(() => {
+      el.style.opacity = '1';
+      ring.animate(
+        [
+          { transform: 'scale(.94)', opacity: 0 },
+          { transform: 'scale(1)', opacity: 1 },
+        ],
+        { duration: 220, easing: 'cubic-bezier(0.4, 0, 0.2, 1)', fill: 'forwards' }
+      );
+    });
     setTimeout(() => {
       if (!el.isConnected) return;
       el.style.opacity = '0';
@@ -1273,6 +1310,10 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     overlayGeneration += 1;
     root.querySelectorAll('[data-agent-browser-recording-overlay], [data-agent-browser-recording-key], [data-agent-browser-recording-spotlight]').forEach(el => el.remove());
     overlayChain = Promise.resolve();
+  }
+
+  function nextAnimationFrame() {
+    return new Promise(resolve => requestAnimationFrame(resolve));
   }
 
   function snapshotZoomStyles() {
@@ -1299,9 +1340,11 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     zoomOriginalStyles = null;
   }
 
-  function zoomTo(x, y, scale, durationMs = null) {
+  async function zoomTo(x, y, scale, durationMs = null) {
     const s = Math.max(1, Math.min(3, Number(scale) || 1));
     clearTimeout(zoomResetTimer);
+    zoomGeneration += 1;
+    const generation = zoomGeneration;
     const body = document.body;
     if (!body) return;
     snapshotZoomStyles();
@@ -1320,20 +1363,35 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     document.documentElement.style.overflow = 'hidden';
     body.style.overflow = 'hidden';
     body.style.transformOrigin = `${originX}px ${originY}px`;
+    body.style.transition = 'none';
+    void body.getBoundingClientRect();
+    await nextAnimationFrame();
+    if (generation !== zoomGeneration) return;
     body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
     body.style.transform = `scale(${s})`;
     if (durationMs !== null && durationMs !== undefined) {
-      zoomResetTimer = setTimeout(() => zoomReset(), Math.max(1, Number(durationMs) || 1));
+      zoomResetTimer = setTimeout(() => zoomReset(generation), Math.max(1, Number(durationMs) || 1));
     }
   }
 
-  async function zoomReset() {
+  async function zoomReset(expectedGeneration = null) {
     clearTimeout(zoomResetTimer);
     const body = document.body;
     if (!body) return;
+    const generation = expectedGeneration ?? ++zoomGeneration;
+    if (expectedGeneration === null) zoomGeneration = generation;
+    const computedTransform = getComputedStyle(body).transform;
+    if (computedTransform && computedTransform !== 'none') {
+      body.style.transition = 'none';
+      body.style.transform = computedTransform;
+      void body.getBoundingClientRect();
+      await nextAnimationFrame();
+      if (generation !== zoomGeneration) return;
+    }
     body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
-    body.style.transform = '';
+    body.style.transform = zoomOriginalStyles?.bodyTransform || '';
     await new Promise(resolve => setTimeout(resolve, 700));
+    if (generation !== zoomGeneration) return;
     restoreZoomStyles();
   }
 
@@ -1350,6 +1408,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     cursorVisible = false;
     overlayGeneration += 1;
     overlayChain = Promise.resolve();
+    zoomGeneration += 1;
     restoreZoomStyles();
   }
 

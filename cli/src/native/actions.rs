@@ -31,7 +31,7 @@ use super::providers;
 use super::react;
 use super::recording::{self, RecordingState};
 use super::recording_effects::{
-    InputMode, OverlayPosition, RecordEffectsPreset, RecordingEffectsConfig,
+    InputMode, OverlayPosition, RecordEffectsPreset, RecordMode, RecordingEffectsConfig,
     RecordingEffectsHandle, RecordingEffectsState,
 };
 use super::screenshot::{self, ScreenshotOptions};
@@ -61,6 +61,9 @@ const AUTH_LOGIN_SELECTOR_POLL_INTERVAL_MS: u64 = 100;
 /// Time spent trying targeted username selectors before broad text-input
 /// fallback selectors are allowed.
 const AUTH_LOGIN_PREFERRED_SELECTOR_WINDOW_MS: u64 = 5_000;
+const DEMO_CAPTURE_START_PREROLL_MS: u64 = 350;
+const DEMO_CAPTURE_DEFAULT_ACTION_MS: u64 = 1_200;
+const DEMO_CAPTURE_MAX_ACTION_MS: u64 = 8_000;
 
 pub struct PendingConfirmation {
     pub action: String,
@@ -614,6 +617,7 @@ impl DaemonState {
             self.recording_state.fps,
             shared_count.clone(),
             cancel_rx,
+            self.recording_state.capture_gate.clone(),
         );
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
@@ -633,9 +637,32 @@ impl DaemonState {
         }
         post_roll = post_roll.min(std::time::Duration::from_millis(4_500));
         if !post_roll.is_zero() {
+            self.activate_demo_recording_for(post_roll).await;
             tokio::time::sleep(post_roll).await;
         }
         recording::stop_recording_task(&mut self.recording_state).await
+    }
+
+    async fn activate_demo_recording_for(&self, duration: std::time::Duration) {
+        if let Some(ref gate) = self.recording_state.capture_gate {
+            gate.activate_for(duration).await;
+        }
+    }
+
+    async fn extend_demo_recording_from_effects(&self) {
+        let Some(ref gate) = self.recording_state.capture_gate else {
+            return;
+        };
+        let mut duration = std::time::Duration::from_millis(DEMO_CAPTURE_DEFAULT_ACTION_MS);
+        if let Some(ref effects) = self.recording_effects {
+            let effect_duration = effects
+                .lock()
+                .await
+                .stop_post_roll_duration(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(DEMO_CAPTURE_MAX_ACTION_MS));
+            duration = duration.max(effect_duration);
+        }
+        gate.activate_for(duration).await;
     }
 
     pub async fn drain_cdp_events_background(&mut self) {
@@ -1564,6 +1591,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    activate_demo_recording_for_action(action, cmd, state).await;
+
     let result = match action {
         "launch" => handle_launch(cmd, state).await,
         "navigate" => handle_navigate(cmd, state).await,
@@ -1737,6 +1766,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
 
+    if resp
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        extend_demo_recording_after_action(action, state).await;
+    }
+
     // Re-drain so a dialog opened by THIS command is reflected in the warning
     // below; events are otherwise only drained at the start of a command.
     state.drain_cdp_events_background().await;
@@ -1782,6 +1819,127 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     }
 
     resp
+}
+
+async fn activate_demo_recording_for_action(action: &str, cmd: &Value, state: &DaemonState) {
+    if state.recording_state.capture_gate.is_none() || !demo_recording_action_is_visual(action) {
+        return;
+    }
+    let duration = demo_recording_action_preroll_duration(action, cmd, state).await;
+    state.activate_demo_recording_for(duration).await;
+}
+
+async fn extend_demo_recording_after_action(action: &str, state: &DaemonState) {
+    if state.recording_state.capture_gate.is_none() || !demo_recording_action_is_visual(action) {
+        return;
+    }
+    state.extend_demo_recording_from_effects().await;
+}
+
+fn demo_recording_action_is_visual(action: &str) -> bool {
+    matches!(
+        action,
+        "navigate"
+            | "back"
+            | "forward"
+            | "reload"
+            | "tab_new"
+            | "tab_switch"
+            | "click"
+            | "dblclick"
+            | "tap"
+            | "drag"
+            | "swipe"
+            | "hover"
+            | "mousemove"
+            | "mousedown"
+            | "mouseup"
+            | "mouse"
+            | "input_mouse"
+            | "scroll"
+            | "wheel"
+            | "scrollintoview"
+            | "fill"
+            | "type"
+            | "press"
+            | "keyboard"
+            | "input_keyboard"
+            | "keydown"
+            | "keyup"
+            | "inserttext"
+            | "focus"
+            | "clear"
+            | "selectall"
+            | "select"
+            | "multiselect"
+            | "check"
+            | "uncheck"
+            | "setvalue"
+            | "dispatch"
+            | "upload"
+            | "recording_overlay"
+            | "recording_zoom"
+    )
+}
+
+async fn demo_recording_action_preroll_duration(
+    action: &str,
+    cmd: &Value,
+    state: &DaemonState,
+) -> std::time::Duration {
+    let ms = match action {
+        "recording_overlay" | "recording_zoom" => 350,
+        "fill" | "type" | "keyboard" | "input_keyboard" | "inserttext" => {
+            let text_len = cmd
+                .get("text")
+                .or_else(|| cmd.get("value"))
+                .and_then(|v| v.as_str())
+                .map(str::len)
+                .unwrap_or(0) as u64;
+            let input_delay_ms = if let Some(ref effects) = state.recording_effects {
+                let guard = effects.lock().await;
+                let cfg = guard.config();
+                if matches!(cfg.input_mode, InputMode::Animated) {
+                    cfg.input_delay_ms.max(1)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if input_delay_ms == 0 {
+                350
+            } else {
+                500_u64.saturating_add(text_len.saturating_mul(input_delay_ms))
+            }
+        }
+        "navigate" | "back" | "forward" | "reload" | "tab_new" | "tab_switch" => 1_500,
+        "scroll" | "wheel" | "scrollintoview" | "swipe" => 1_500,
+        "click" | "dblclick" | "tap" | "hover" | "mousemove" | "mouse" | "input_mouse" => {
+            demo_recording_cursor_preroll_ms(state).await
+        }
+        _ => 350,
+    };
+    std::time::Duration::from_millis(ms.min(DEMO_CAPTURE_MAX_ACTION_MS))
+}
+
+async fn demo_recording_cursor_preroll_ms(state: &DaemonState) -> u64 {
+    let Some(ref effects) = state.recording_effects else {
+        return 350;
+    };
+    let guard = effects.lock().await;
+    let Some(cursor) = guard.config().cursor.as_ref() else {
+        return 350;
+    };
+    let tween_ms = if matches!(cursor.motion, super::recording_effects::MotionMode::Off) {
+        0
+    } else {
+        cursor.tween_ms as u64
+    };
+    tween_ms
+        .saturating_add(cursor.click_ms as u64)
+        .saturating_add(200)
+        .max(350)
 }
 
 // ---------------------------------------------------------------------------
@@ -4594,6 +4752,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     state.recording_state.fps = fps;
 
     let effects_config = recording_effects_config_from_cmd(cmd)?;
+    let demo_capture = matches!(recording_mode_from_cmd(cmd)?, RecordMode::Demo);
 
     let (client, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -4740,7 +4899,18 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     .await?;
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
+    if demo_capture {
+        state.recording_state.capture_gate =
+            Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
+    }
     state.start_recording_task(client, new_session_id).await?;
+    if demo_capture {
+        state
+            .activate_demo_recording_for(std::time::Duration::from_millis(
+                DEMO_CAPTURE_START_PREROLL_MS,
+            ))
+            .await;
+    }
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
@@ -4787,6 +4957,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     clear_recording_effects(state).await;
 
     let effects_config = recording_effects_config_from_cmd(cmd)?;
+    let demo_capture = matches!(recording_mode_from_cmd(cmd)?, RecordMode::Demo);
 
     let previous_path = if state.recording_state.active {
         recording::recording_stop(&mut state.recording_state)
@@ -4807,11 +4978,22 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     };
 
     recording::recording_start(&mut state.recording_state, path)?;
+    if demo_capture {
+        state.recording_state.capture_gate =
+            Some(Arc::new(recording::RecordingCaptureGate::new_paused()));
+    }
 
     if let Some((client, session_id)) = recording_target {
         setup_recording_effects(state, effects_config, client.clone(), session_id.clone()).await?;
 
         state.start_recording_task(client, session_id).await?;
+        if demo_capture {
+            state
+                .activate_demo_recording_for(std::time::Duration::from_millis(
+                    DEMO_CAPTURE_START_PREROLL_MS,
+                ))
+                .await;
+        }
     }
 
     Ok(json!({
@@ -4845,11 +5027,7 @@ async fn setup_recording_effects(
 fn recording_effects_config_from_cmd(
     cmd: &Value,
 ) -> Result<Option<RecordingEffectsConfig>, String> {
-    let effects_preset = match cmd.get("effects").and_then(|v| v.as_str()) {
-        Some(v) => RecordEffectsPreset::from_str(v)?,
-        None if cmd.get("cursor").is_some() => RecordEffectsPreset::Cursor,
-        None => RecordEffectsPreset::Cursor,
-    };
+    let effects_preset = recording_effects_preset_from_cmd(cmd)?;
     RecordingEffectsConfig::from_cmd(
         effects_preset,
         cmd.get("cursor"),
@@ -4858,6 +5036,28 @@ fn recording_effects_config_from_cmd(
         cmd.get("inputMode").and_then(|v| v.as_str()),
         cmd.get("inputDelayMs").and_then(|v| v.as_u64()),
     )
+}
+
+fn recording_effects_preset_from_cmd(cmd: &Value) -> Result<RecordEffectsPreset, String> {
+    match cmd.get("effects").and_then(|v| v.as_str()) {
+        Some(v) => RecordEffectsPreset::from_str(v),
+        None if cmd.get("cursor").is_some() => Ok(RecordEffectsPreset::Cursor),
+        None => Ok(RecordEffectsPreset::Cursor),
+    }
+}
+
+fn recording_mode_from_cmd(cmd: &Value) -> Result<RecordMode, String> {
+    if let Some(v) = cmd.get("recordMode").and_then(|v| v.as_str()) {
+        return RecordMode::from_str(v);
+    }
+    if matches!(
+        recording_effects_preset_from_cmd(cmd)?,
+        RecordEffectsPreset::Demo
+    ) {
+        Ok(RecordMode::Demo)
+    } else {
+        Ok(RecordMode::Automation)
+    }
 }
 
 async fn clear_recording_effects(state: &mut DaemonState) {
@@ -4899,15 +5099,15 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
             Ok(json!({ "overlay": "text" }))
         }
         "spotlight" => {
-            let (x, y) = recording_point_from_cmd(cmd, state).await?;
+            let (x, y, radius) = recording_spotlight_target_from_cmd(cmd, state).await?;
             let duration_ms = cmd
                 .get("durationMs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1_200);
             RecordingEffectsHandle { shared: effects }
-                .spotlight(x, y, duration_ms)
+                .spotlight(x, y, duration_ms, radius)
                 .await?;
-            Ok(json!({ "overlay": "spotlight", "x": x, "y": y }))
+            Ok(json!({ "overlay": "spotlight", "x": x, "y": y, "radius": radius }))
         }
         "clear" => {
             RecordingEffectsHandle { shared: effects }
@@ -4920,6 +5120,41 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
             other
         )),
     }
+}
+
+async fn recording_spotlight_target_from_cmd(
+    cmd: &Value,
+    state: &DaemonState,
+) -> Result<(f64, f64, Option<f64>), String> {
+    let explicit_radius = cmd.get("radius").and_then(|v| v.as_f64());
+    let (x, y) = recording_point_from_cmd(cmd, state).await?;
+    if explicit_radius.is_some() || cmd.get("selector").is_none() {
+        return Ok((x, y, explicit_radius));
+    }
+
+    let Some(selector) = cmd.get("selector").and_then(|v| v.as_str()) else {
+        return Ok((x, y, explicit_radius));
+    };
+    let Some(mgr) = state.browser.as_ref() else {
+        return Ok((x, y, explicit_radius));
+    };
+    let session_id = mgr.active_session_id()?.to_string();
+    let radius = super::element::get_element_bounding_box(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await
+    .ok()
+    .map(|bbox| {
+        let w = bbox.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let h = bbox.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        ((w.hypot(h) / 2.0) + 24.0).clamp(44.0, 260.0)
+    });
+
+    Ok((x, y, radius))
 }
 
 async fn handle_recording_zoom(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -10472,5 +10707,18 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    #[test]
+    fn test_record_mode_demo_survives_effects_off() {
+        let cmd = json!({
+            "recordMode": "demo",
+            "effects": "off"
+        });
+        assert!(matches!(
+            recording_mode_from_cmd(&cmd).unwrap(),
+            RecordMode::Demo
+        ));
+        assert!(recording_effects_config_from_cmd(&cmd).unwrap().is_none());
     }
 }

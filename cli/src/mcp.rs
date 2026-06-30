@@ -1286,7 +1286,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_START,
             "Record start",
-            "Start video recording.",
+            "Start video recording. In demo mode, recording captures visual activity and automatically pauses between agent/tool calls, so inference delays do not create idle video.",
             recording_tool_properties(),
             &["path"],
         ),
@@ -1307,13 +1307,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_OVERLAY,
             "Record overlay",
-            "Add or clear a browser-rendered recording overlay. For demo videos, rehearse first, start recording, introduce the step with a short bottom overlay, optionally spotlight the target, perform the action, then clear or move on.",
+            "Add or clear a browser-rendered recording overlay. Text overlays auto-dismiss after durationMs. In demo mode, overlay display time is captured while idle gaps between tool calls are skipped.",
             json!({
                 "kind": { "type": "string", "enum": ["text", "spotlight", "clear"] },
                 "text": { "type": "string" },
                 "selector": { "type": "string" },
                 "x": { "type": "number" },
                 "y": { "type": "number" },
+                "radius": { "type": "number", "exclusiveMinimum": 0 },
                 "position": { "type": "string", "enum": ["top", "center", "bottom"] },
                 "durationMs": { "type": "integer", "minimum": 0 }
             }),
@@ -2932,9 +2933,10 @@ fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, 
             if arguments.get("selector").is_some()
                 || arguments.get("x").is_some()
                 || arguments.get("y").is_some()
+                || arguments.get("radius").is_some()
             {
                 return Err(ProtocolError::invalid_params(
-                    "record_overlay kind=text does not accept selector, x, or y",
+                    "record_overlay kind=text does not accept selector, x, y, or radius",
                 ));
             }
             args.push(required_string(arguments, "text")?);
@@ -2946,17 +2948,22 @@ fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, 
                 ));
             }
             append_record_target_args(arguments, &mut args, "record_overlay kind=spotlight")?;
+            if let Some(radius) = optional_number_string(arguments, "radius")? {
+                args.push("--radius".to_string());
+                args.push(radius);
+            }
         }
         "clear" => {
             if arguments.get("text").is_some()
                 || arguments.get("selector").is_some()
                 || arguments.get("x").is_some()
                 || arguments.get("y").is_some()
+                || arguments.get("radius").is_some()
                 || arguments.get("position").is_some()
                 || arguments.get("durationMs").is_some()
             {
                 return Err(ProtocolError::invalid_params(
-                    "record_overlay kind=clear does not accept text, selector, x, y, position, or durationMs",
+                    "record_overlay kind=clear does not accept text, selector, x, y, radius, position, or durationMs",
                 ));
             }
         }
@@ -3865,6 +3872,7 @@ mod tests {
             "kind": "spotlight",
             "x": 640,
             "y": 360,
+            "radius": 96,
             "durationMs": 1200
         }))
         .unwrap();
@@ -3879,6 +3887,8 @@ mod tests {
                 "640",
                 "--y",
                 "360",
+                "--radius",
+                "96",
                 "--duration-ms",
                 "1200"
             ]

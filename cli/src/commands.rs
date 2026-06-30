@@ -2294,6 +2294,30 @@ fn apply_record_overlay_flags(
                 cmd["durationMs"] = json!(n);
                 i += 2;
             }
+            "--radius" => {
+                if !allow_coordinates {
+                    return Err(ParseError::InvalidValue {
+                        message: "--radius is only valid for record overlay spotlight".to_string(),
+                        usage:
+                            "record overlay spotlight --x <number> --y <number> --radius <number>",
+                    });
+                }
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "record overlay --radius".to_string(),
+                        usage: "record overlay spotlight --radius <number>",
+                    })?;
+                let n = parse_record_coordinate(v, "record overlay --radius")?;
+                if n <= 0.0 {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--radius must be greater than 0 (got '{}')", v),
+                        usage: "record overlay spotlight --radius <number>",
+                    });
+                }
+                cmd["radius"] = json!(n);
+                i += 2;
+            }
             "--x" => {
                 if !allow_coordinates {
                     return Err(ParseError::InvalidValue {
@@ -4827,7 +4851,7 @@ mod tests {
     #[test]
     fn test_record_overlay_spotlight_coordinates() {
         let cmd = parse_command(
-            &args("record overlay spotlight --x 640 --y 360 --duration-ms 1200"),
+            &args("record overlay spotlight --x 640 --y 360 --radius 96 --duration-ms 1200"),
             &default_flags(),
         )
         .unwrap();
@@ -4835,6 +4859,7 @@ mod tests {
         assert_eq!(cmd["kind"], "spotlight");
         assert_eq!(cmd["x"], 640.0);
         assert_eq!(cmd["y"], 360.0);
+        assert_eq!(cmd["radius"], 96.0);
         assert_eq!(cmd["durationMs"], 1200);
         assert!(cmd.get("selector").is_none());
     }

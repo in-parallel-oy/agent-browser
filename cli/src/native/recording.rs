@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex, Notify};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{CaptureScreenshotParams, CaptureScreenshotResult};
@@ -29,6 +29,7 @@ pub struct RecordingState {
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub cancel_tx: Option<oneshot::Sender<()>>,
     pub stop_post_roll: Duration,
+    pub capture_gate: Option<Arc<RecordingCaptureGate>>,
 }
 
 impl RecordingState {
@@ -42,6 +43,55 @@ impl RecordingState {
             shared_frame_count: None,
             cancel_tx: None,
             stop_post_roll: Duration::ZERO,
+            capture_gate: None,
+        }
+    }
+}
+
+/// Activity gate for demo recordings. Normal recordings capture wall-clock
+/// time continuously; demo recordings only capture while a browser action or
+/// recording effect is visually active, so agent inference time is not encoded
+/// into the video.
+#[derive(Debug)]
+pub struct RecordingCaptureGate {
+    active_until: Mutex<Option<Instant>>,
+    notify: Notify,
+}
+
+impl RecordingCaptureGate {
+    pub fn new_paused() -> Self {
+        Self {
+            active_until: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    pub async fn activate_for(&self, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let until = Instant::now() + duration;
+        let mut active_until = self.active_until.lock().await;
+        if active_until.is_none_or(|current| until > current) {
+            *active_until = Some(until);
+        }
+        drop(active_until);
+        self.notify.notify_one();
+    }
+
+    async fn is_active(&self) -> bool {
+        self.active_until
+            .lock()
+            .await
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    async fn wait_until_active(&self) {
+        loop {
+            if self.is_active().await {
+                return;
+            }
+            self.notify.notified().await;
         }
     }
 }
@@ -67,6 +117,7 @@ pub fn recording_start(state: &mut RecordingState, path: &str) -> Result<Value, 
     state.active = true;
     state.output_path = path.to_string();
     state.frame_count = 0;
+    state.capture_gate = None;
 
     Ok(json!({ "started": true, "path": path }))
 }
@@ -77,6 +128,7 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
     }
 
     state.active = false;
+    state.capture_gate = None;
 
     if state.frame_count == 0 {
         return Err("No frames captured".to_string());
@@ -173,6 +225,7 @@ pub fn spawn_recording_task(
     fps: u32,
     shared_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
+    capture_gate: Option<Arc<RecordingCaptureGate>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let mut cancel_rx = std::pin::pin!(cancel_rx);
@@ -194,7 +247,7 @@ pub fn spawn_recording_task(
         let mut interval = tokio::time::interval(capture_interval(fps));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut started_at = None;
-        let mut frames_written = 0_u64;
+        let mut segment_frames_written = 0_u64;
 
         let params = CaptureScreenshotParams {
             format: Some("jpeg".to_string()),
@@ -205,9 +258,29 @@ pub fn spawn_recording_task(
         };
 
         loop {
+            if let Some(ref gate) = capture_gate {
+                if !gate.is_active().await {
+                    started_at = None;
+                    segment_frames_written = 0;
+                    tokio::select! {
+                        _ = &mut cancel_rx => break,
+                        _ = gate.wait_until_active() => {}
+                    }
+                    interval.reset();
+                }
+            }
+
             tokio::select! {
                 _ = &mut cancel_rx => break,
-            _ = interval.tick() => {}
+                _ = interval.tick() => {}
+            }
+
+            if let Some(ref gate) = capture_gate {
+                if !gate.is_active().await {
+                    started_at = None;
+                    segment_frames_written = 0;
+                    continue;
+                }
             }
 
             let result: Result<CaptureScreenshotResult, _> = client
@@ -233,7 +306,7 @@ pub fn spawn_recording_task(
             };
             let now = Instant::now();
             let capture_started_at = *started_at.get_or_insert(now);
-            let due_frames = due_frame_count(capture_started_at, now, fps, frames_written);
+            let due_frames = due_frame_count(capture_started_at, now, fps, segment_frames_written);
             let mut write_failed = false;
             for _ in 0..due_frames {
                 if stdin.write_all(&bytes).await.is_err() {
@@ -241,7 +314,7 @@ pub fn spawn_recording_task(
                     break;
                 }
                 shared_count.fetch_add(1, Ordering::Relaxed);
-                frames_written += 1;
+                segment_frames_written += 1;
             }
             if write_failed {
                 break;
@@ -420,6 +493,15 @@ mod tests {
             due_frame_count(started_at, started_at + Duration::from_secs(10), 30, 1),
             60
         );
+    }
+
+    #[tokio::test]
+    async fn test_recording_capture_gate_starts_paused() {
+        let gate = RecordingCaptureGate::new_paused();
+        assert!(!gate.is_active().await);
+
+        gate.activate_for(Duration::from_millis(25)).await;
+        assert!(gate.is_active().await);
     }
 
     #[test]
