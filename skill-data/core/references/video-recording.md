@@ -48,7 +48,7 @@ agent-browser record restart ./take2.webm
 
 ## Recording Effects
 
-The OS cursor is never visible in `record start` output because CDP `Page.captureScreenshot` renders the page DOM only, with no OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. Effects are composited into captured frames after each screenshot, so they do not depend on page-side scripts and do not change page layout. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
+The OS cursor is never visible in `record start` output because CDP `Page.captureScreenshot` renders the page DOM only, with no OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. Effects are injected into the recorded page, so Chromium renders anti-aliased SVG, CSS, and text animations before each frame is captured. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
 
 ```bash
 # Default: arrow cursor, 250ms tween, 400ms click ripple, 28px
@@ -77,11 +77,11 @@ agent-browser record start ./demo.webm \
 | Flag                       | Default | Description                                                |
 |----------------------------|---------|------------------------------------------------------------|
 | `--record-effects <preset>` | cursor | Legacy preset alias: `cursor`, `demo`, or `off`. |
-| `--record-mode <mode>`     | automation | `automation` or `demo`. `demo` blocks click timing and animates fill/type. |
+| `--record-mode <mode>`     | automation | `automation` or `demo`. `demo` uses slower cursor timing, blocks click timing, and animates fill/type. |
 | `--no-cursor`              | (off)   | Compatibility alias for `--record-effects off`. Cannot be combined with `--cursor`. |
 | `--cursor <theme>`         | `arrow` | `arrow`, `dot`, `hand`, or `off`. Override the default theme or hide the cursor while keeping explicit effects available. |
-| `--cursor-tween-ms <n>`    | 250     | Duration of the cursor's animated path between targets.    |
-| `--cursor-click-ms <n>`    | 400     | Duration of the click-ripple animation.                    |
+| `--cursor-tween-ms <n>`    | 250     | Duration of the cursor's animated path between targets. Demo mode defaults to 700 unless explicitly set. |
+| `--cursor-click-ms <n>`    | 400     | Duration of the click-ripple animation. Demo mode defaults to 500 unless explicitly set. |
 | `--cursor-size <n>`        | 28      | Cursor size in CSS pixels (8-96).                          |
 | `--cursor-motion <mode>`   | auto    | `auto` renders while effects are active, `always` keeps the idle cursor visible, and `off` disables tween motion entirely (cursor teleports). |
 | `--cursor-block-clicks`    | off     | Await the tween before each click. Default is fire-and-forget so click latency is unchanged. |
@@ -94,24 +94,26 @@ agent-browser record start ./demo.webm \
 ```bash
 agent-browser record overlay text "Explain this step" --position bottom
 agent-browser record overlay spotlight @e4 --duration-ms 1200
+agent-browser record overlay spotlight --x 640 --y 360 --duration-ms 1200
 agent-browser record overlay clear
 agent-browser record zoom to @e4 --scale 1.45
+agent-browser record zoom to --x 640 --y 360 --scale 1.45
 agent-browser record zoom reset
 ```
 
-Text overlays serialize and default to five seconds when no duration is supplied. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom.
+Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, and `--duration-ms` controls when the next queued overlay may appear; the visible overlay remains until replaced or cleared. Spotlight fades out after `--duration-ms`. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom.
 
 ### Sync Model
 
 By default the tween fires in parallel with the click (no added click latency). At 30 fps capture, a 250 ms tween shows up across multiple frames so the cursor visibly travels and lands as the click registers. When strict visual fidelity matters more than click timing, pass `--click-sync block` or use `--record-mode demo`.
 
-The `demo` mode keeps page behavior unchanged except for intentional action timing: clicks wait for the cursor tween, and fill/type use animated input defaults. Spotlight, text overlay, cursor, ripple, and camera zoom are all rendered by the recording compositor from the same frame timeline.
+The `demo` mode keeps page behavior unchanged except for intentional action timing: cursor flight and click pulses are slower, clicks wait for the cursor tween, and fill/type use animated input defaults. Spotlight, text overlay, cursor, ripple, and zoom are browser-rendered recording effects, so the video captures the same smooth animations Chromium paints on the page.
 
 ### Limits
 
 - **Recording-only.** The dashboard live screencast is unchanged.
-- **Frame compositing cost.** Effect-enabled recordings decode, draw, and re-encode captured frames. Very large viewports can reduce effective capture throughput.
-- **Top-frame coordinates.** Element centers are resolved through the active frame, then drawn in screenshot coordinates. Complex transformed iframe layouts may need verification in the final artifact.
+- **Page-injected effects.** Effect-enabled recordings install a temporary recording layer into the captured page. It is removed when recording stops.
+- **Frame coordinates.** Element centers are resolved through the active frame, then sent to the recording layer. Complex transformed iframe layouts may need verification in the final artifact.
 - **`record restart` starts a new effects timeline.** Any active overlay or zoom is cleared when recording restarts.
 
 ## Use Cases

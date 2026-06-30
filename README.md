@@ -820,20 +820,21 @@ agent-browser snapshot -i -c -d 5         # Combine options
 
 ## Video Recording
 
-The `record` command captures browser automation as WebM video. The default `cursor` effects preset renders a synthetic cursor because CDP screenshots do not include the OS cursor. Use `--record-mode demo` for presentation timing defaults: clicks wait for the cursor tween and fill/type actions animate with a short per-character delay. Zoom and overlay effects are explicit commands so normal clicks remain cursor flight plus click ripple only.
+The `record` command captures browser automation as WebM video. The default `cursor` effects preset renders a synthetic cursor because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders the cursor, click burst, overlays, and zoom with normal SVG, CSS, and text anti-aliasing before each frame is captured. Use `--record-mode demo` for presentation timing defaults: cursor movement and click pulses are slower, clicks wait for the cursor tween, and fill/type actions animate with a short per-character delay. Zoom and overlay effects are explicit commands so normal clicks remain cursor flight plus click ripple only.
 
 ```bash
 agent-browser open https://app.example.com
 agent-browser record start ./demo.webm --record-mode demo
 agent-browser record overlay text "Choose a plan" --position bottom
 agent-browser record zoom to @e1 --scale 1.45
+agent-browser record overlay spotlight --x 640 --y 360 --duration-ms 1200
 agent-browser click @e1
 agent-browser keyboard type "hello"
 agent-browser record zoom reset
 agent-browser record stop
 ```
 
-Use `--record-effects off` or `--no-cursor` for a clean recording without synthetic effects. Use `--cursor off` to keep the compositor available for explicit zoom/overlay effects while hiding the cursor. Text overlays serialize and default to five seconds when no duration is supplied. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. Existing cursor tuning flags such as `--cursor dot`, `--cursor-tween-ms`, and `--cursor-click-ms` still work for advanced cursor styling. The default `--cursor-motion auto` renders the cursor during effect activity; use `--cursor-motion always` when you want the cursor to remain visible while idle.
+Use `--record-effects off` or `--no-cursor` for a clean recording without synthetic effects. Use `--cursor off` to keep explicit zoom/overlay effects available while hiding the cursor. Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, and `--duration-ms` controls when the next queued overlay may appear; the visible overlay remains until replaced or cleared. Spotlight fades out after `--duration-ms`. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. Existing cursor tuning flags such as `--cursor dot`, `--cursor-tween-ms`, and `--cursor-click-ms` still work for advanced cursor styling, and explicit timing flags override the slower demo defaults. The default `--cursor-motion auto` renders the cursor during effect activity; use `--cursor-motion always` when you want the cursor to remain visible while idle.
 
 ## Annotated Screenshots
 

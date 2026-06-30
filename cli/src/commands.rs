@@ -2209,17 +2209,25 @@ fn parse_record_overlay(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             Ok(cmd)
         }
         "spotlight" => {
-            let target = rest.get(1).copied().ok_or(ParseError::MissingArguments {
-                context: "record overlay spotlight".to_string(),
-                usage: "record overlay spotlight <selector|ref> [--duration-ms <n>]",
-            })?;
+            let target = rest.get(1).copied().filter(|arg| !arg.starts_with("--"));
             let mut cmd = json!({
                 "id": id,
                 "action": "recording_overlay",
                 "kind": "spotlight",
-                "selector": target,
             });
-            apply_record_overlay_flags(&rest[2..], &mut cmd, false)?;
+            if let Some(target) = target {
+                cmd["selector"] = json!(target);
+            }
+            apply_record_overlay_flags(
+                &rest[if target.is_some() { 2 } else { 1 }..],
+                &mut cmd,
+                false,
+            )?;
+            validate_record_point_args(
+                &cmd,
+                "record overlay spotlight",
+                "record overlay spotlight <selector|ref>|--x <n> --y <n> [--duration-ms <n>]",
+            )?;
             Ok(cmd)
         }
         "clear" => {
@@ -2284,6 +2292,28 @@ fn apply_record_overlay_flags(
                 cmd["durationMs"] = json!(n);
                 i += 2;
             }
+            "--x" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "record overlay --x".to_string(),
+                        usage: "record overlay spotlight --x <number> --y <number>",
+                    })?;
+                let n = parse_record_coordinate(v, "record overlay --x")?;
+                cmd["x"] = json!(n);
+                i += 2;
+            }
+            "--y" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "record overlay --y".to_string(),
+                        usage: "record overlay spotlight --x <number> --y <number>",
+                    })?;
+                let n = parse_record_coordinate(v, "record overlay --y")?;
+                cmd["y"] = json!(n);
+                i += 2;
+            }
             other => {
                 return Err(ParseError::InvalidValue {
                     message: format!("Unknown record overlay flag '{}'", other),
@@ -2303,17 +2333,16 @@ fn parse_record_zoom(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     })?;
     match sub {
         "to" => {
-            let target = rest.get(1).copied().ok_or(ParseError::MissingArguments {
-                context: "record zoom to".to_string(),
-                usage: "record zoom to <selector|ref> [--scale <n>] [--duration-ms <n>]",
-            })?;
+            let target = rest.get(1).copied().filter(|arg| !arg.starts_with("--"));
             let mut cmd = json!({
                 "id": id,
                 "action": "recording_zoom",
                 "mode": "to",
-                "selector": target,
             });
-            let mut i = 2;
+            if let Some(target) = target {
+                cmd["selector"] = json!(target);
+            }
+            let mut i = if target.is_some() { 2 } else { 1 };
             while i < rest.len() {
                 match rest[i] {
                     "--scale" => {
@@ -2347,6 +2376,28 @@ fn parse_record_zoom(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                         cmd["durationMs"] = json!(n);
                         i += 2;
                     }
+                    "--x" => {
+                        let v = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: "record zoom --x".to_string(),
+                                usage: "record zoom to --x <number> --y <number>",
+                            })?;
+                        let n = parse_record_coordinate(v, "record zoom --x")?;
+                        cmd["x"] = json!(n);
+                        i += 2;
+                    }
+                    "--y" => {
+                        let v = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: "record zoom --y".to_string(),
+                                usage: "record zoom to --x <number> --y <number>",
+                            })?;
+                        let n = parse_record_coordinate(v, "record zoom --y")?;
+                        cmd["y"] = json!(n);
+                        i += 2;
+                    }
                     other => {
                         return Err(ParseError::InvalidValue {
                             message: format!("Unknown record zoom flag '{}'", other),
@@ -2356,6 +2407,11 @@ fn parse_record_zoom(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     }
                 }
             }
+            validate_record_point_args(
+                &cmd,
+                "record zoom to",
+                "record zoom to <selector|ref>|--x <n> --y <n> [--scale <n>] [--duration-ms <n>]",
+            )?;
             Ok(cmd)
         }
         "reset" => {
@@ -2371,6 +2427,52 @@ fn parse_record_zoom(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             valid_options: VALID,
         }),
     }
+}
+
+fn parse_record_coordinate(value: &str, context: &'static str) -> Result<f64, ParseError> {
+    let n: f64 = value.parse().map_err(|_| ParseError::InvalidValue {
+        message: format!("coordinate expects a number (got '{}')", value),
+        usage: context,
+    })?;
+    if !n.is_finite() {
+        return Err(ParseError::InvalidValue {
+            message: format!("coordinate must be finite (got '{}')", value),
+            usage: context,
+        });
+    }
+    Ok(n)
+}
+
+fn validate_record_point_args(
+    cmd: &Value,
+    context: &str,
+    usage: &'static str,
+) -> Result<(), ParseError> {
+    let has_selector = cmd.get("selector").is_some();
+    let has_x = cmd.get("x").is_some();
+    let has_y = cmd.get("y").is_some();
+    if has_selector && (has_x || has_y) {
+        return Err(ParseError::InvalidValue {
+            message: format!(
+                "{} accepts either selector/ref or x/y coordinates, not both",
+                context
+            ),
+            usage,
+        });
+    }
+    if has_x != has_y {
+        return Err(ParseError::MissingArguments {
+            context: context.to_string(),
+            usage,
+        });
+    }
+    if !has_selector && !(has_x && has_y) {
+        return Err(ParseError::MissingArguments {
+            context: context.to_string(),
+            usage,
+        });
+    }
+    Ok(())
 }
 
 fn reject_trailing_record_args(rest: &[&str], usage: &'static str) -> Result<(), ParseError> {
@@ -4697,6 +4799,45 @@ mod tests {
         assert_eq!(cmd["selector"], "@e4");
         assert_eq!(cmd["scale"], 1.45);
         assert_eq!(cmd["durationMs"], 1400);
+    }
+
+    #[test]
+    fn test_record_overlay_spotlight_coordinates() {
+        let cmd = parse_command(
+            &args("record overlay spotlight --x 640 --y 360 --duration-ms 1200"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_overlay");
+        assert_eq!(cmd["kind"], "spotlight");
+        assert_eq!(cmd["x"], 640.0);
+        assert_eq!(cmd["y"], 360.0);
+        assert_eq!(cmd["durationMs"], 1200);
+        assert!(cmd.get("selector").is_none());
+    }
+
+    #[test]
+    fn test_record_zoom_to_coordinates() {
+        let cmd = parse_command(
+            &args("record zoom to --x 640 --y 360 --scale 1.45"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_zoom");
+        assert_eq!(cmd["mode"], "to");
+        assert_eq!(cmd["x"], 640.0);
+        assert_eq!(cmd["y"], 360.0);
+        assert_eq!(cmd["scale"], 1.45);
+        assert!(cmd.get("selector").is_none());
+    }
+
+    #[test]
+    fn test_record_zoom_to_rejects_selector_with_coordinates() {
+        let result = parse_command(
+            &args("record zoom to @e4 --x 640 --y 360"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

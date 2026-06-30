@@ -24,7 +24,7 @@ If no URL is provided, recording starts from the current page. The recording con
 
 ## Recording effects
 
-The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for presentation timing defaults, then add zoom and overlay emphasis explicitly.
+The default `cursor` preset renders a synthetic cursor into the video because CDP screenshots do not include the OS cursor. Effects are injected into the recorded page, so Chromium renders cursor SVGs, click bursts, overlays, and zoom animations before each frame is captured. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing, then add zoom and overlay emphasis explicitly.
 
 The default `--cursor-motion auto` renders the cursor while effects are active. Use `--cursor-motion always` when idle cursor visibility matters.
 
@@ -41,7 +41,7 @@ agent-browser record zoom reset
   </thead>
   <tbody>
     <tr><td><code>cursor</code></td><td>Default synthetic cursor and click pulse</td></tr>
-    <tr><td><code>demo</code></td><td>Cursor and click pulse with blocking click timing and animated fill/type defaults</td></tr>
+    <tr><td><code>demo</code></td><td>Slower cursor flight and click pulse with blocking click timing and animated fill/type defaults</td></tr>
     <tr><td><code>off</code></td><td>No synthetic recording effects</td></tr>
   </tbody>
 </table>
@@ -56,9 +56,9 @@ agent-browser record zoom reset
     <tr><td><code>record start &lt;path.webm&gt; [url]</code></td><td>Start recording to a WebM file</td></tr>
     <tr><td><code>record stop</code></td><td>Stop the active recording and save the file</td></tr>
     <tr><td><code>record restart &lt;path.webm&gt; [url]</code></td><td>Stop the current recording and immediately start another</td></tr>
-    <tr><td><code>record overlay text &lt;text&gt;</code></td><td>Add a serialized subtitle-style text overlay to the recording. Defaults to five seconds unless <code>--duration-ms</code> is passed.</td></tr>
-    <tr><td><code>record overlay spotlight &lt;selector|ref&gt;</code></td><td>Highlight an element in the recording</td></tr>
-    <tr><td><code>record zoom to &lt;selector|ref&gt;</code></td><td>Apply camera zoom around an element without changing page layout. Holds until reset unless <code>--duration-ms</code> is passed.</td></tr>
+    <tr><td><code>record overlay text &lt;text&gt;</code></td><td>Add a serialized subtitle-style text overlay to the recording. <code>--duration-ms</code> controls when the next queued overlay may appear; the visible overlay remains until replaced or cleared.</td></tr>
+    <tr><td><code>record overlay spotlight &lt;selector|ref&gt;</code> or <code>--x &lt;n&gt; --y &lt;n&gt;</code></td><td>Highlight an element or viewport coordinate in the recording for the requested duration.</td></tr>
+    <tr><td><code>record zoom to &lt;selector|ref&gt;</code> or <code>--x &lt;n&gt; --y &lt;n&gt;</code></td><td>Apply a recording-only zoom around an element or viewport coordinate. Holds until reset unless <code>--duration-ms</code> is passed.</td></tr>
     <tr><td><code>record zoom reset</code></td><td>Clear active camera zoom</td></tr>
   </tbody>
 </table>

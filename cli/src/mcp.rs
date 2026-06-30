@@ -1307,11 +1307,13 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_OVERLAY,
             "Record overlay",
-            "Add or clear a recording overlay effect.",
+            "Add or clear a browser-rendered recording overlay. For demo videos, rehearse first, start recording, introduce the step with a short bottom overlay, optionally spotlight the target, perform the action, then clear or move on.",
             json!({
                 "kind": { "type": "string", "enum": ["text", "spotlight", "clear"] },
                 "text": { "type": "string" },
                 "selector": { "type": "string" },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
                 "position": { "type": "string", "enum": ["top", "center", "bottom"] },
                 "durationMs": { "type": "integer", "minimum": 0 }
             }),
@@ -1320,10 +1322,12 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_ZOOM,
             "Record zoom",
-            "Apply or reset recording camera zoom.",
+            "Apply or reset deliberate browser-rendered recording zoom. Use zoom separately from clicks: overlay what will happen, zoom to a selector or x/y point for emphasis, click or fill, then reset before stopping.",
             json!({
                 "mode": { "type": "string", "enum": ["to", "reset"] },
                 "selector": { "type": "string" },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
                 "scale": { "type": "number" },
                 "durationMs": { "type": "integer", "minimum": 0 }
             }),
@@ -2902,22 +2906,36 @@ fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, 
                     "position is only valid for record_overlay kind=text",
                 ));
             }
+            let x = optional_number_string(arguments, "x")?;
+            let y = optional_number_string(arguments, "y")?;
             if let Some(selector) = optional_string(arguments, "selector")? {
+                if x.is_some() || y.is_some() {
+                    return Err(ProtocolError::invalid_params(
+                        "record_overlay kind=spotlight accepts either selector or x/y, not both",
+                    ));
+                }
                 args.push(selector);
+            } else if let (Some(x), Some(y)) = (x, y) {
+                args.push("--x".to_string());
+                args.push(x);
+                args.push("--y".to_string());
+                args.push(y);
             } else {
                 return Err(ProtocolError::invalid_params(
-                    "MCP coordinate spotlight is not supported by CLI adapter yet; pass selector",
+                    "record_overlay kind=spotlight requires selector or both x and y",
                 ));
             }
         }
         "clear" => {
             if arguments.get("text").is_some()
                 || arguments.get("selector").is_some()
+                || arguments.get("x").is_some()
+                || arguments.get("y").is_some()
                 || arguments.get("position").is_some()
                 || arguments.get("durationMs").is_some()
             {
                 return Err(ProtocolError::invalid_params(
-                    "record_overlay kind=clear does not accept text, selector, position, or durationMs",
+                    "record_overlay kind=clear does not accept text, selector, x, y, position, or durationMs",
                 ));
             }
         }
@@ -2939,21 +2957,43 @@ fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, 
 }
 
 fn call_record_zoom(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, record_zoom_args_from_arguments(arguments)?, None)
+}
+
+fn record_zoom_args_from_arguments(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mode = required_string(arguments, "mode")?;
     let mut args = vec!["record".to_string(), "zoom".to_string(), mode.clone()];
     match mode.as_str() {
         "to" => {
-            let selector = optional_string(arguments, "selector")?
-                .ok_or_else(|| ProtocolError::invalid_params("record zoom to requires selector"))?;
-            args.push(selector);
+            let x = optional_number_string(arguments, "x")?;
+            let y = optional_number_string(arguments, "y")?;
+            if let Some(selector) = optional_string(arguments, "selector")? {
+                if x.is_some() || y.is_some() {
+                    return Err(ProtocolError::invalid_params(
+                        "record_zoom mode=to accepts either selector or x/y, not both",
+                    ));
+                }
+                args.push(selector);
+            } else if let (Some(x), Some(y)) = (x, y) {
+                args.push("--x".to_string());
+                args.push(x);
+                args.push("--y".to_string());
+                args.push(y);
+            } else {
+                return Err(ProtocolError::invalid_params(
+                    "record_zoom mode=to requires selector or both x and y",
+                ));
+            }
         }
         "reset" => {
             if arguments.get("selector").is_some()
+                || arguments.get("x").is_some()
+                || arguments.get("y").is_some()
                 || arguments.get("scale").is_some()
                 || arguments.get("durationMs").is_some()
             {
                 return Err(ProtocolError::invalid_params(
-                    "record_zoom mode=reset does not accept selector, scale, or durationMs",
+                    "record_zoom mode=reset does not accept selector, x, y, scale, or durationMs",
                 ));
             }
         }
@@ -2971,7 +3011,7 @@ fn call_record_zoom(arguments: &Value) -> Result<Value, ProtocolError> {
         args.push("--duration-ms".to_string());
         args.push(duration.to_string());
     }
-    call_cli_tool(arguments, args, None)
+    Ok(args)
 }
 
 fn call_clearable(arguments: &Value, command: &str) -> Result<Value, ProtocolError> {
@@ -3814,6 +3854,87 @@ mod tests {
         assert!(!names.contains(&TOOL_PLUGIN_LIST));
         assert!(!names.contains(&TOOL_REACT_TREE));
         assert!(result.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn record_overlay_args_support_coordinates() {
+        let args = record_overlay_args_from_arguments(&json!({
+            "kind": "spotlight",
+            "x": 640,
+            "y": 360,
+            "durationMs": 1200
+        }))
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "record",
+                "overlay",
+                "spotlight",
+                "--x",
+                "640",
+                "--y",
+                "360",
+                "--duration-ms",
+                "1200"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_overlay_args_reject_selector_with_coordinates() {
+        let err = record_overlay_args_from_arguments(&json!({
+            "kind": "spotlight",
+            "selector": "@e4",
+            "x": 640,
+            "y": 360
+        }))
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn record_zoom_args_support_coordinates() {
+        let args = record_zoom_args_from_arguments(&json!({
+            "mode": "to",
+            "x": 640,
+            "y": 360,
+            "scale": 1.45,
+            "durationMs": 1200
+        }))
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "record",
+                "zoom",
+                "to",
+                "--x",
+                "640",
+                "--y",
+                "360",
+                "--scale",
+                "1.45",
+                "--duration-ms",
+                "1200"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_zoom_args_reject_selector_with_coordinates() {
+        let err = record_zoom_args_from_arguments(&json!({
+            "mode": "to",
+            "selector": "@e4",
+            "x": 640,
+            "y": 360
+        }))
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
     }
 
     #[test]

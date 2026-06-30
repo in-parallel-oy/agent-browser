@@ -317,7 +317,7 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-A synthetic animated cursor is baked into the recording **by default** (the OS cursor isn't captured because frames come from `Page.captureScreenshot`). Use `--record-mode demo` for human-readable timing defaults: clicks wait for the cursor tween and fill/type actions animate with a short delay. Clicks do not zoom automatically; add emphasis with explicit `record overlay` and `record zoom` commands. Override the cursor theme with `--cursor <theme>` (`arrow`, `dot`, `hand`) or disable effects entirely with `--record-effects off`:
+A synthetic animated cursor is baked into the recording **by default** (the OS cursor isn't captured because frames come from `Page.captureScreenshot`). Recording effects are injected into the recorded page, so Chromium renders smooth SVG, CSS, and text animations before each frame is captured. Use `--record-mode demo` for human-readable timing defaults: cursor flight and click pulses are slower, clicks wait for the cursor tween, and fill/type actions animate with a short delay. Clicks do not zoom automatically; add emphasis with explicit `record overlay` and `record zoom` commands. Override the cursor theme with `--cursor <theme>` (`arrow`, `dot`, `hand`) or disable effects entirely with `--record-effects off`:
 
 ```bash
 # Default cursor (arrow)
@@ -327,6 +327,7 @@ agent-browser record start demo.webm https://example.com
 agent-browser record start demo.webm --record-mode demo
 agent-browser record overlay text "Choose a plan" --position bottom
 agent-browser record zoom to @e4 --scale 1.45
+agent-browser record overlay spotlight --x 640 --y 360 --duration-ms 1200
 
 # Disable effects for a clean recording
 agent-browser record start demo.webm --record-effects off

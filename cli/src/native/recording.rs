@@ -2,20 +2,19 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{CaptureScreenshotParams, CaptureScreenshotResult};
-use super::recording_effects::RecordingEffectsState;
 
 /// Default capture cadence. 30 fps is the lowest rate at which sub-frame
 /// motion (cursor tween, click ripple) reads as smooth animation; 10 fps
 /// strobes too much to register tween motion at all when the page is
 /// otherwise still. ffmpeg pipe cost is negligible at these rates.
 pub const DEFAULT_CAPTURE_FPS: u32 = 30;
-/// Lower bound -- below this, ffmpeg's image2pipe demuxer rejects timestamps.
+/// Lower bound. Below this, ffmpeg's image2pipe demuxer rejects timestamps.
 const MIN_CAPTURE_FPS: u32 = 1;
 /// Upper bound. Anything higher and CDP captureScreenshot can't keep up.
 const MAX_CAPTURE_FPS: u32 = 60;
@@ -146,10 +145,18 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
 }
 
 fn capture_interval(fps: u32) -> Duration {
-    // Round down -- if fps doesn't divide evenly, we'd rather capture slightly
-    // faster than the declared rate (ffmpeg drops/dupes to the encoder framerate).
+    // Round down because if fps doesn't divide evenly, we'd rather capture
+    // slightly faster than the declared rate.
     let fps = fps.max(1) as u64;
     Duration::from_millis(1000 / fps)
+}
+
+fn due_frame_count(started_at: Instant, now: Instant, fps: u32, frames_written: u64) -> u64 {
+    let elapsed = now
+        .checked_duration_since(started_at)
+        .unwrap_or(Duration::ZERO);
+    let target_frames = (elapsed.as_secs_f64() * fps.max(1) as f64).floor() as u64 + 1;
+    target_frames.saturating_sub(frames_written).max(1)
 }
 
 /// Spawn a background task that captures screenshots at a fixed interval
@@ -161,7 +168,6 @@ pub fn spawn_recording_task(
     fps: u32,
     shared_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
-    effects: Option<Arc<Mutex<RecordingEffectsState>>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let mut cancel_rx = std::pin::pin!(cancel_rx);
@@ -182,6 +188,8 @@ pub fn spawn_recording_task(
 
         let mut interval = tokio::time::interval(capture_interval(fps));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut started_at = None;
+        let mut frames_written = 0_u64;
 
         let params = CaptureScreenshotParams {
             format: Some("jpeg".to_string()),
@@ -218,16 +226,21 @@ pub fn spawn_recording_task(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let bytes = if let Some(ref effects) = effects {
-                RecordingEffectsState::process_frame(effects, bytes).await
-            } else {
-                bytes
-            };
-
-            if stdin.write_all(&bytes).await.is_err() {
+            let now = Instant::now();
+            let capture_started_at = *started_at.get_or_insert(now);
+            let due_frames = due_frame_count(capture_started_at, now, fps, frames_written);
+            let mut write_failed = false;
+            for _ in 0..due_frames {
+                if stdin.write_all(&bytes).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+                shared_count.fetch_add(1, Ordering::Relaxed);
+                frames_written += 1;
+            }
+            if write_failed {
                 break;
             }
-            shared_count.fetch_add(1, Ordering::Relaxed);
         }
 
         drop(stdin);
@@ -379,6 +392,20 @@ mod tests {
         assert_eq!(capture_interval(30).as_millis(), 33);
         assert_eq!(capture_interval(10).as_millis(), 100);
         assert_eq!(capture_interval(60).as_millis(), 16);
+    }
+
+    #[test]
+    fn test_due_frame_count_preserves_wall_clock_time() {
+        let started_at = Instant::now();
+        assert_eq!(due_frame_count(started_at, started_at, 30, 0), 1);
+        assert_eq!(
+            due_frame_count(started_at, started_at + Duration::from_millis(500), 30, 1),
+            15
+        );
+        assert_eq!(
+            due_frame_count(started_at, started_at + Duration::from_millis(1000), 30, 16),
+            15
+        );
     }
 
     #[test]

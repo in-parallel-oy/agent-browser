@@ -604,7 +604,6 @@ impl DaemonState {
         &mut self,
         client: Arc<CdpClient>,
         session_id: String,
-        effects: Option<Arc<Mutex<RecordingEffectsState>>>,
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -615,7 +614,6 @@ impl DaemonState {
             self.recording_state.fps,
             shared_count.clone(),
             cancel_rx,
-            effects,
         );
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
@@ -4733,12 +4731,16 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         (mgr.client.clone(), new_session_id)
     };
 
-    let effects = setup_recording_effects(state, effects_config).await;
+    setup_recording_effects(
+        state,
+        effects_config,
+        client.clone(),
+        new_session_id.clone(),
+    )
+    .await?;
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
-    state
-        .start_recording_task(client, new_session_id, effects)
-        .await?;
+    state.start_recording_task(client, new_session_id).await?;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
@@ -4807,11 +4809,9 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     recording::recording_start(&mut state.recording_state, path)?;
 
     if let Some((client, session_id)) = recording_target {
-        let effects = setup_recording_effects(state, effects_config).await;
+        setup_recording_effects(state, effects_config, client.clone(), session_id.clone()).await?;
 
-        state
-            .start_recording_task(client, session_id, effects)
-            .await?;
+        state.start_recording_task(client, session_id).await?;
     }
 
     Ok(json!({
@@ -4824,17 +4824,22 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
 async fn setup_recording_effects(
     state: &mut DaemonState,
     effects_config: Option<RecordingEffectsConfig>,
-) -> Option<Arc<Mutex<RecordingEffectsState>>> {
+    client: Arc<CdpClient>,
+    session_id: String,
+) -> Result<Option<Arc<Mutex<RecordingEffectsState>>>, String> {
     let device_scale_factor = state.viewport.map(|(_, _, scale, _)| scale).unwrap_or(1.0);
-    let effects = effects_config
-        .map(|config| {
-            let mut effects_state = RecordingEffectsState::new(config);
+    let effects = match effects_config {
+        Some(config) => {
+            let mut effects_state =
+                RecordingEffectsState::new_with_target(config, client, session_id);
             effects_state.set_device_scale_factor(device_scale_factor);
-            effects_state
-        })
-        .map(|state| Arc::new(Mutex::new(state)));
+            effects_state.install().await?;
+            Some(Arc::new(Mutex::new(effects_state)))
+        }
+        None => None,
+    };
     state.recording_effects = effects.clone();
-    effects
+    Ok(effects)
 }
 
 fn recording_effects_config_from_cmd(
@@ -4856,6 +4861,12 @@ fn recording_effects_config_from_cmd(
 }
 
 async fn clear_recording_effects(state: &mut DaemonState) {
+    if let Some(ref effects) = state.recording_effects {
+        let handle = RecordingEffectsHandle {
+            shared: effects.clone(),
+        };
+        let _ = handle.cleanup().await;
+    }
     state.recording_effects = None;
     state.recording_state.stop_post_roll = std::time::Duration::ZERO;
 }
@@ -4882,10 +4893,9 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
                 .get("durationMs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5_000);
-            effects
-                .lock()
-                .await
-                .overlay_text(text.to_string(), position, duration_ms);
+            RecordingEffectsHandle { shared: effects }
+                .overlay_text(text.to_string(), position, duration_ms)
+                .await?;
             Ok(json!({ "overlay": "text" }))
         }
         "spotlight" => {
@@ -4894,11 +4904,15 @@ async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Va
                 .get("durationMs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1_200);
-            effects.lock().await.spotlight(x, y, duration_ms);
+            RecordingEffectsHandle { shared: effects }
+                .spotlight(x, y, duration_ms)
+                .await?;
             Ok(json!({ "overlay": "spotlight", "x": x, "y": y }))
         }
         "clear" => {
-            effects.lock().await.clear_overlay();
+            RecordingEffectsHandle { shared: effects }
+                .clear_overlay()
+                .await?;
             Ok(json!({ "overlay": "cleared" }))
         }
         other => Err(format!(
@@ -4920,11 +4934,15 @@ async fn handle_recording_zoom(cmd: &Value, state: &DaemonState) -> Result<Value
             let (x, y) = recording_point_from_cmd(cmd, state).await?;
             let scale = cmd.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.45);
             let duration_ms = cmd.get("durationMs").and_then(|v| v.as_u64());
-            effects.lock().await.zoom_to(x, y, scale, duration_ms);
+            RecordingEffectsHandle { shared: effects }
+                .zoom_to(x, y, scale, duration_ms)
+                .await?;
             Ok(json!({ "zoom": "to", "x": x, "y": y, "scale": scale }))
         }
         "reset" => {
-            effects.lock().await.zoom_reset();
+            RecordingEffectsHandle { shared: effects }
+                .zoom_reset()
+                .await?;
             Ok(json!({ "zoom": "reset" }))
         }
         other => Err(format!(
@@ -7246,7 +7264,7 @@ async fn handle_video_start(cmd: &Value, state: &mut DaemonState) -> Result<Valu
 
     recording::recording_start(&mut state.recording_state, path)?;
     state
-        .start_recording_task(mgr.client.clone(), session_id, None)
+        .start_recording_task(mgr.client.clone(), session_id)
         .await?;
 
     Ok(json!({

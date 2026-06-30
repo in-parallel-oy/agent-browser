@@ -2419,9 +2419,9 @@ Usage: agent-browser record start <path.webm> [url] [effect flags]
        agent-browser record stop
        agent-browser record restart <path.webm> [url] [effect flags]
        agent-browser record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]
-       agent-browser record overlay spotlight <selector|ref> [--duration-ms <n>]
+       agent-browser record overlay spotlight <selector|ref>|--x <n> --y <n> [--duration-ms <n>]
        agent-browser record overlay clear
-       agent-browser record zoom to <selector|ref> [--scale <n>] [--duration-ms <n>]
+       agent-browser record zoom to <selector|ref>|--x <n> --y <n> [--scale <n>] [--duration-ms <n>]
        agent-browser record zoom reset
 
 Record the browser to a WebM video file.
@@ -2436,9 +2436,9 @@ Operations:
 Recording Effects:
   --record-effects <preset>   cursor (default), demo, or off; legacy preset alias
   --record-mode <mode>        automation (default) or demo
-                              demo blocks click timing and animates fill/type
+                              demo uses slower cursor timing, blocks clicks, and animates fill/type
 
-Cursor (rendered into video by the recording compositor):
+Cursor (rendered by the browser into captured video frames):
   --no-cursor                Disable all synthetic effects
   --cursor <theme>           arrow (default), dot, hand, or off
   --cursor-tween-ms <n>      Tween duration between targets, default 250
@@ -2452,10 +2452,15 @@ Cursor (rendered into video by the recording compositor):
   --input-delay-ms <n>       Delay between typed characters when animated
 
 Click records cursor flight plus click ripple only. Use explicit `record zoom`
-and `record overlay` commands for presentation emphasis. Camera zoom is
-composited into captured frames and does not mutate page zoom or layout.
-Text overlays serialize and default to five seconds. Zoom holds until reset
-unless you pass --duration-ms for a temporary zoom.
+and `record overlay` commands for presentation emphasis. Recording effects
+are injected into the recorded page so Chromium renders smooth SVG, CSS, and
+text animations before each frame is captured.
+Text overlays serialize, and --duration-ms controls when the next queued
+overlay may appear; the visible overlay remains until replaced or cleared.
+Spotlight fades out after --duration-ms.
+Zoom holds until reset unless you pass --duration-ms for a temporary zoom.
+Demo mode defaults to a 700 ms cursor tween and 500 ms click ripple unless
+you pass explicit cursor timing flags.
 Tuning flags imply the default `arrow` theme when used without `--cursor`.
 `--cursor` and `--no-cursor` together is a parse error.
 
@@ -2484,6 +2489,7 @@ Examples:
   agent-browser record start ./demo.webm --record-mode demo
   agent-browser record overlay text "Choose a plan" --position bottom
   agent-browser record zoom to @e4 --scale 1.45
+  agent-browser record overlay spotlight --x 640 --y 360 --duration-ms 1200
   agent-browser record zoom reset
 
   # Restart recording with a new file
@@ -3307,7 +3313,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM); compositor cursor is ON
+  record start <path> [url]  Start video recording (WebM); browser-rendered cursor is ON
                              by default (pass --no-cursor to disable)
   record stop                Stop and save video
   console [--clear]          View console logs
