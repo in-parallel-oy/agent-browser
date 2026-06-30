@@ -96,6 +96,8 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "recording_start",
     "recording_stop",
     "recording_restart",
+    "recording_overlay",
+    "recording_zoom",
     "pdf",
     "tab_list",
     "tab_new",

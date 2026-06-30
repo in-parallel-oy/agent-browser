@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{CaptureScreenshotParams, CaptureScreenshotResult};
+use super::recording_effects::RecordingEffectsState;
 
 /// Default capture cadence. 30 fps is the lowest rate at which sub-frame
 /// motion (cursor tween, click ripple) reads as smooth animation; 10 fps
@@ -27,6 +28,7 @@ pub struct RecordingState {
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub cancel_tx: Option<oneshot::Sender<()>>,
+    pub stop_post_roll: Duration,
 }
 
 impl RecordingState {
@@ -39,6 +41,7 @@ impl RecordingState {
             capture_task: None,
             shared_frame_count: None,
             cancel_tx: None,
+            stop_post_roll: Duration::ZERO,
         }
     }
 }
@@ -158,6 +161,7 @@ pub fn spawn_recording_task(
     fps: u32,
     shared_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
+    effects: Option<Arc<Mutex<RecordingEffectsState>>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let mut cancel_rx = std::pin::pin!(cancel_rx);
@@ -190,7 +194,7 @@ pub fn spawn_recording_task(
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => break,
-                _ = interval.tick() => {}
+            _ = interval.tick() => {}
             }
 
             let result: Result<CaptureScreenshotResult, _> = client
@@ -213,6 +217,11 @@ pub fn spawn_recording_task(
             ) {
                 Ok(b) => b,
                 Err(_) => continue,
+            };
+            let bytes = if let Some(ref effects) = effects {
+                RecordingEffectsState::process_frame(effects, bytes).await
+            } else {
+                bytes
             };
 
             if stdin.write_all(&bytes).await.is_err() {

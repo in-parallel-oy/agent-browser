@@ -9,8 +9,6 @@ pub mod cdp;
 #[allow(dead_code)]
 pub mod cookies;
 #[allow(dead_code)]
-pub mod cursor_overlay;
-#[allow(dead_code)]
 pub mod daemon;
 #[allow(dead_code)]
 pub mod diff;
@@ -30,6 +28,8 @@ pub mod providers;
 pub mod react;
 #[allow(dead_code)]
 pub mod recording;
+#[allow(dead_code)]
+pub mod recording_effects;
 #[allow(dead_code)]
 pub mod screenshot;
 #[allow(dead_code)]

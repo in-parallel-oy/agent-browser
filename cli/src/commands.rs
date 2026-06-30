@@ -1559,13 +1559,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === Recording (browser video recording) ===
         "record" => {
-            const VALID: &[&str] = &["start", "stop", "restart"];
+            const VALID: &[&str] = &["start", "stop", "restart", "overlay", "zoom"];
             match rest.first().copied() {
                 Some("start") => {
                     let parsed = split_record_args(&rest[1..], "record start")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record start <output.webm> [url] [--record-effects <cursor|demo|off>] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
@@ -1580,6 +1580,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     if let Some(n) = parsed.fps {
                         cmd["fps"] = json!(n);
                     }
+                    cmd["effects"] = json!(parsed.effects);
+                    if let Some(v) = parsed.record_mode {
+                        cmd["recordMode"] = json!(v);
+                    }
+                    if let Some(v) = parsed.click_sync {
+                        cmd["clickSync"] = json!(v);
+                    }
+                    if let Some(v) = parsed.input_mode {
+                        cmd["inputMode"] = json!(v);
+                    }
+                    if let Some(v) = parsed.input_delay_ms {
+                        cmd["inputDelayMs"] = json!(v);
+                    }
                     if let Some(c) = parsed.cursor {
                         cmd["cursor"] = c;
                     }
@@ -1590,7 +1603,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     let parsed = split_record_args(&rest[1..], "record restart")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record restart <output.webm> [url] [--record-effects <cursor|demo|off>] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
@@ -1605,11 +1618,26 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     if let Some(n) = parsed.fps {
                         cmd["fps"] = json!(n);
                     }
+                    cmd["effects"] = json!(parsed.effects);
+                    if let Some(v) = parsed.record_mode {
+                        cmd["recordMode"] = json!(v);
+                    }
+                    if let Some(v) = parsed.click_sync {
+                        cmd["clickSync"] = json!(v);
+                    }
+                    if let Some(v) = parsed.input_mode {
+                        cmd["inputMode"] = json!(v);
+                    }
+                    if let Some(v) = parsed.input_delay_ms {
+                        cmd["inputDelayMs"] = json!(v);
+                    }
                     if let Some(c) = parsed.cursor {
                         cmd["cursor"] = c;
                     }
                     Ok(cmd)
                 }
+                Some("overlay") => parse_record_overlay(&rest[1..], &id),
+                Some("zoom") => parse_record_zoom(&rest[1..], &id),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
                     valid_options: VALID,
@@ -1879,13 +1907,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 struct RecordArgs<'a> {
     positional: Vec<&'a str>,
     cursor: Option<Value>,
+    effects: String,
+    record_mode: Option<&'a str>,
+    click_sync: Option<&'a str>,
+    input_mode: Option<&'a str>,
+    input_delay_ms: Option<u64>,
     fps: Option<u32>,
 }
 
 /// Split a `record start`/`record restart` argument list into positional
 /// args (path, optional url) and the optional flag-driven overrides.
 ///
-/// Recognised flags: `--record-fps <n>`; cursor: `--cursor <theme>`,
+/// Recognised flags: `--record-fps <n>`; effects:
+/// `--record-effects <cursor|demo|off>`; cursor: `--cursor <theme>`,
 /// `--cursor-tween-ms <n>`, `--cursor-click-ms <n>`, `--cursor-size <n>`,
 /// `--cursor-motion <mode>`, `--cursor-block-clicks`, `--no-cursor`.
 ///
@@ -1899,6 +1933,11 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
     let mut cursor_obj = serde_json::Map::new();
     let mut cursor_seen = false;
     let mut no_cursor = false;
+    let mut effects: Option<&str> = None;
+    let mut record_mode: Option<&str> = None;
+    let mut click_sync: Option<&str> = None;
+    let mut input_mode: Option<&str> = None;
+    let mut input_delay_ms: Option<u64> = None;
     let mut fps: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1928,17 +1967,58 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                 no_cursor = true;
                 i += 1;
             }
+            "--record-effects" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --record-effects", context),
+                        usage: "record start <output> [url] --record-effects <cursor|demo|off>",
+                    })?;
+                if !matches!(*v, "cursor" | "demo" | "off") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "--record-effects expects one of cursor|demo|off (got '{}')",
+                            v
+                        ),
+                        usage: "record start <output> [url] --record-effects <cursor|demo|off>",
+                    });
+                }
+                effects = Some(*v);
+                i += 2;
+            }
+            "--record-mode" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --record-mode", context),
+                        usage: "record start <output> [url] --record-mode <automation|demo>",
+                    })?;
+                if !matches!(*v, "automation" | "demo") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "--record-mode expects one of automation|demo (got '{}')",
+                            v
+                        ),
+                        usage: "record start <output> [url] --record-mode <automation|demo>",
+                    });
+                }
+                record_mode = Some(*v);
+                i += 2;
+            }
             "--cursor" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| ParseError::MissingArguments {
                         context: format!("{} --cursor", context),
-                        usage: "record start <output> [url] --cursor <arrow|dot|hand>",
+                        usage: "record start <output> [url] --cursor <arrow|dot|hand|off>",
                     })?;
-                if !matches!(*v, "arrow" | "dot" | "hand") {
+                if !matches!(*v, "arrow" | "dot" | "hand" | "off") {
                     return Err(ParseError::InvalidValue {
-                        message: format!("--cursor expects one of arrow|dot|hand (got '{}')", v),
-                        usage: "record start <output> [url] --cursor <arrow|dot|hand>",
+                        message: format!(
+                            "--cursor expects one of arrow|dot|hand|off (got '{}')",
+                            v
+                        ),
+                        usage: "record start <output> [url] --cursor <arrow|dot|hand|off>",
                     });
                 }
                 cursor_obj.insert("theme".to_string(), json!(*v));
@@ -1991,6 +2071,55 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                 cursor_seen = true;
                 i += 1;
             }
+            "--click-sync" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --click-sync", context),
+                        usage: "record start <output> [url] --click-sync <async|block>",
+                    })?;
+                if !matches!(*v, "async" | "block") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--click-sync expects one of async|block (got '{}')", v),
+                        usage: "record start <output> [url] --click-sync <async|block>",
+                    });
+                }
+                click_sync = Some(*v);
+                i += 2;
+            }
+            "--input-mode" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --input-mode", context),
+                        usage: "record start <output> [url] --input-mode <fast|animated>",
+                    })?;
+                if !matches!(*v, "fast" | "animated") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--input-mode expects one of fast|animated (got '{}')", v),
+                        usage: "record start <output> [url] --input-mode <fast|animated>",
+                    });
+                }
+                input_mode = Some(*v);
+                i += 2;
+            }
+            "--input-delay-ms" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --input-delay-ms", context),
+                        usage: "record start <output> [url] --input-delay-ms <integer>",
+                    })?;
+                let n: u64 = v.parse().map_err(|_| ParseError::InvalidValue {
+                    message: format!(
+                        "--input-delay-ms expects a non-negative integer (got '{}')",
+                        v
+                    ),
+                    usage: "record start <output> [url] --input-delay-ms <integer>",
+                })?;
+                input_delay_ms = Some(n);
+                i += 2;
+            }
             _ => {
                 positional.push(tok);
                 i += 1;
@@ -1998,11 +2127,24 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
         }
     }
 
-    // --cursor and --no-cursor together is contradictory; fail loudly.
+    // Cursor/effects disabling and cursor tuning together is contradictory; fail loudly.
     if cursor_seen && no_cursor {
         return Err(ParseError::InvalidValue {
             message: "--cursor and --no-cursor cannot both be set".to_string(),
             usage: "record start <output> [url] [--cursor <theme> | --no-cursor]",
+        });
+    }
+    if matches!(effects, Some("off")) && cursor_seen {
+        return Err(ParseError::InvalidValue {
+            message: "--record-effects off cannot be combined with cursor tuning flags".to_string(),
+            usage: "record start <output> [url] [--record-effects <cursor|demo|off>]",
+        });
+    }
+    if no_cursor && effects.is_some_and(|v| v != "off") {
+        return Err(ParseError::InvalidValue {
+            message: "--no-cursor cannot be combined with --record-effects cursor or demo"
+                .to_string(),
+            usage: "record start <output> [url] [--record-effects <cursor|demo|off>]",
         });
     }
 
@@ -2016,9 +2158,15 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
     //   * --no-cursor: emit no cursor object (cursor disabled).
     //   * any --cursor* flag seen: emit the explicitly-configured object.
     //   * neither: emit a minimal `{theme: "arrow"}` object so the daemon
-    //     installs the cursor with all other defaults from
-    //     `CursorOverlayConfig::from_cmd_value`.
-    let cursor = if no_cursor {
+    //     enables the compositor cursor with all other defaults from
+    //     `CursorEffectsConfig::from_cmd_value`.
+    let effects = if no_cursor {
+        "off"
+    } else {
+        effects.unwrap_or("cursor")
+    };
+
+    let cursor = if effects == "off" {
         None
     } else if cursor_seen {
         Some(Value::Object(cursor_obj))
@@ -2030,8 +2178,209 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
     Ok(RecordArgs {
         positional,
         cursor,
+        effects: effects.to_string(),
+        record_mode,
+        click_sync,
+        input_mode,
+        input_delay_ms,
         fps,
     })
+}
+
+fn parse_record_overlay(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const VALID: &[&str] = &["text", "spotlight", "clear"];
+    let sub = rest.first().copied().ok_or(ParseError::MissingArguments {
+        context: "record overlay".to_string(),
+        usage: "record overlay <text|spotlight|clear>",
+    })?;
+    match sub {
+        "text" => {
+            let text = rest.get(1).copied().ok_or(ParseError::MissingArguments {
+                context: "record overlay text".to_string(),
+                usage: "record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]",
+            })?;
+            let mut cmd = json!({
+                "id": id,
+                "action": "recording_overlay",
+                "kind": "text",
+                "text": text,
+            });
+            apply_record_overlay_flags(&rest[2..], &mut cmd, true)?;
+            Ok(cmd)
+        }
+        "spotlight" => {
+            let target = rest.get(1).copied().ok_or(ParseError::MissingArguments {
+                context: "record overlay spotlight".to_string(),
+                usage: "record overlay spotlight <selector|ref> [--duration-ms <n>]",
+            })?;
+            let mut cmd = json!({
+                "id": id,
+                "action": "recording_overlay",
+                "kind": "spotlight",
+                "selector": target,
+            });
+            apply_record_overlay_flags(&rest[2..], &mut cmd, false)?;
+            Ok(cmd)
+        }
+        "clear" => {
+            reject_trailing_record_args(&rest[1..], "record overlay clear")?;
+            Ok(json!({
+                "id": id,
+                "action": "recording_overlay",
+                "kind": "clear",
+            }))
+        }
+        other => Err(ParseError::UnknownSubcommand {
+            subcommand: other.to_string(),
+            valid_options: VALID,
+        }),
+    }
+}
+
+fn apply_record_overlay_flags(
+    rest: &[&str],
+    cmd: &mut Value,
+    allow_position: bool,
+) -> Result<(), ParseError> {
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--position" => {
+                if !allow_position {
+                    return Err(ParseError::InvalidValue {
+                        message: "--position is only valid for record overlay text".to_string(),
+                        usage: "record overlay text <text> --position <top|center|bottom>",
+                    });
+                }
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "record overlay --position".to_string(),
+                        usage: "record overlay text <text> --position <top|center|bottom>",
+                    })?;
+                if !matches!(*v, "top" | "center" | "bottom") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "--position expects one of top|center|bottom (got '{}')",
+                            v
+                        ),
+                        usage: "record overlay text <text> --position <top|center|bottom>",
+                    });
+                }
+                cmd["position"] = json!(*v);
+                i += 2;
+            }
+            "--duration-ms" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "record overlay --duration-ms".to_string(),
+                        usage: "record overlay <text|spotlight> ... --duration-ms <integer>",
+                    })?;
+                let n: u64 = v.parse().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--duration-ms expects a non-negative integer (got '{}')", v),
+                    usage: "record overlay <text|spotlight> ... --duration-ms <integer>",
+                })?;
+                cmd["durationMs"] = json!(n);
+                i += 2;
+            }
+            other => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown record overlay flag '{}'", other),
+                    usage: "record overlay <text|spotlight|clear>",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_record_zoom(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const VALID: &[&str] = &["to", "reset"];
+    let sub = rest.first().copied().ok_or(ParseError::MissingArguments {
+        context: "record zoom".to_string(),
+        usage: "record zoom <to|reset>",
+    })?;
+    match sub {
+        "to" => {
+            let target = rest.get(1).copied().ok_or(ParseError::MissingArguments {
+                context: "record zoom to".to_string(),
+                usage: "record zoom to <selector|ref> [--scale <n>] [--duration-ms <n>]",
+            })?;
+            let mut cmd = json!({
+                "id": id,
+                "action": "recording_zoom",
+                "mode": "to",
+                "selector": target,
+            });
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i] {
+                    "--scale" => {
+                        let v = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: "record zoom --scale".to_string(),
+                                usage: "record zoom to <selector|ref> --scale <number>",
+                            })?;
+                        let n: f64 = v.parse().map_err(|_| ParseError::InvalidValue {
+                            message: format!("--scale expects a number (got '{}')", v),
+                            usage: "record zoom to <selector|ref> --scale <number>",
+                        })?;
+                        cmd["scale"] = json!(n);
+                        i += 2;
+                    }
+                    "--duration-ms" => {
+                        let v = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: "record zoom --duration-ms".to_string(),
+                                usage: "record zoom to <selector|ref> --duration-ms <integer>",
+                            })?;
+                        let n: u64 = v.parse().map_err(|_| ParseError::InvalidValue {
+                            message: format!(
+                                "--duration-ms expects a non-negative integer (got '{}')",
+                                v
+                            ),
+                            usage: "record zoom to <selector|ref> --duration-ms <integer>",
+                        })?;
+                        cmd["durationMs"] = json!(n);
+                        i += 2;
+                    }
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown record zoom flag '{}'", other),
+                            usage:
+                                "record zoom to <selector|ref> [--scale <n>] [--duration-ms <n>]",
+                        });
+                    }
+                }
+            }
+            Ok(cmd)
+        }
+        "reset" => {
+            reject_trailing_record_args(&rest[1..], "record zoom reset")?;
+            Ok(json!({
+                "id": id,
+                "action": "recording_zoom",
+                "mode": "reset",
+            }))
+        }
+        other => Err(ParseError::UnknownSubcommand {
+            subcommand: other.to_string(),
+            valid_options: VALID,
+        }),
+    }
+}
+
+fn reject_trailing_record_args(rest: &[&str], usage: &'static str) -> Result<(), ParseError> {
+    if let Some(extra) = rest.first() {
+        return Err(ParseError::InvalidValue {
+            message: format!("Unexpected argument '{}' for {}", extra, usage),
+            usage,
+        });
+    }
+    Ok(())
 }
 
 fn parse_react(rest: &[&str], id: &str) -> Result<Value, ParseError> {
@@ -4212,6 +4561,7 @@ mod tests {
         let cmd = parse_command(&args("record start output.webm"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "recording_start");
         assert_eq!(cmd["path"], "output.webm");
+        assert_eq!(cmd["effects"], "cursor");
         assert!(cmd.get("url").is_none());
     }
 
@@ -4225,6 +4575,7 @@ mod tests {
         assert_eq!(cmd["action"], "recording_start");
         assert_eq!(cmd["path"], "demo.webm");
         assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["effects"], "cursor");
     }
 
     #[test]
@@ -4266,6 +4617,7 @@ mod tests {
             parse_command(&args("record start out.webm --no-cursor"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "recording_start");
         assert!(cmd.get("cursor").is_none());
+        assert_eq!(cmd["effects"], "off");
     }
 
     #[test]
@@ -4277,6 +4629,7 @@ mod tests {
         .unwrap();
         assert_eq!(cmd["url"], "https://example.com");
         assert!(cmd.get("cursor").is_none());
+        assert_eq!(cmd["effects"], "off");
     }
 
     #[test]
@@ -4287,6 +4640,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cmd["cursor"]["theme"], "dot");
+        assert_eq!(cmd["effects"], "cursor");
+    }
+
+    #[test]
+    fn test_record_start_demo_effects() {
+        let cmd = parse_command(
+            &args("record start out.webm --record-effects demo"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["effects"], "demo");
+        assert_eq!(cmd["cursor"]["theme"], "arrow");
+    }
+
+    #[test]
+    fn test_record_start_record_mode_and_input_flags() {
+        let cmd = parse_command(
+            &args(
+                "record start out.webm --record-mode demo --click-sync block --input-mode animated --input-delay-ms 45 --cursor off",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["effects"], "cursor");
+        assert_eq!(cmd["recordMode"], "demo");
+        assert_eq!(cmd["clickSync"], "block");
+        assert_eq!(cmd["inputMode"], "animated");
+        assert_eq!(cmd["inputDelayMs"], 45);
+        assert_eq!(cmd["cursor"]["theme"], "off");
+    }
+
+    #[test]
+    fn test_record_overlay_text() {
+        let cmd = parse_command(
+            &args("record overlay text Hello --position bottom --duration-ms 1200"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_overlay");
+        assert_eq!(cmd["kind"], "text");
+        assert_eq!(cmd["text"], "Hello");
+        assert_eq!(cmd["position"], "bottom");
+        assert_eq!(cmd["durationMs"], 1200);
+    }
+
+    #[test]
+    fn test_record_zoom_to() {
+        let cmd = parse_command(
+            &args("record zoom to @e4 --scale 1.45 --duration-ms 1400"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_zoom");
+        assert_eq!(cmd["mode"], "to");
+        assert_eq!(cmd["selector"], "@e4");
+        assert_eq!(cmd["scale"], 1.45);
+        assert_eq!(cmd["durationMs"], 1400);
+    }
+
+    #[test]
+    fn test_record_overlay_clear_rejects_trailing_flags() {
+        let result = parse_command(
+            &args("record overlay clear --duration-ms 1000"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_overlay_spotlight_rejects_position() {
+        let result = parse_command(
+            &args("record overlay spotlight @e4 --position bottom"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_zoom_reset_rejects_trailing_flags() {
+        let result = parse_command(
+            &args("record zoom reset --duration-ms 1000"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_start_effects_off() {
+        let cmd = parse_command(
+            &args("record start out.webm --record-effects off"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["effects"], "off");
+        assert!(cmd.get("cursor").is_none());
+    }
+
+    #[test]
+    fn test_record_start_effects_off_conflicts_with_cursor_tuning() {
+        let result = parse_command(
+            &args("record start out.webm --record-effects off --cursor dot"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .format()
+            .contains("--record-effects off"));
     }
 
     #[test]

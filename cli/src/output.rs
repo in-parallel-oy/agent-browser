@@ -2415,9 +2415,14 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url] [cursor flags]
+Usage: agent-browser record start <path.webm> [url] [effect flags]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url] [cursor flags]
+       agent-browser record restart <path.webm> [url] [effect flags]
+       agent-browser record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]
+       agent-browser record overlay spotlight <selector|ref> [--duration-ms <n>]
+       agent-browser record overlay clear
+       agent-browser record zoom to <selector|ref> [--scale <n>] [--duration-ms <n>]
+       agent-browser record zoom reset
 
 Record the browser to a WebM video file.
 Creates a fresh browser context but preserves cookies and localStorage.
@@ -2428,20 +2433,31 @@ Operations:
   stop                   Stop recording and save video
   restart <path> [url]   Stop current recording (if any) and start a new one
 
-Cursor Overlay (ON by default; renders a synthetic cursor in the recording):
-  --no-cursor                Disable the cursor entirely
-  --cursor <theme>           Override the theme; arrow (default), dot, or hand
+Recording Effects:
+  --record-effects <preset>   cursor (default), demo, or off; legacy preset alias
+  --record-mode <mode>        automation (default) or demo
+                              demo blocks click timing and animates fill/type
+
+Cursor (rendered into video by the recording compositor):
+  --no-cursor                Disable all synthetic effects
+  --cursor <theme>           arrow (default), dot, hand, or off
   --cursor-tween-ms <n>      Tween duration between targets, default 250
   --cursor-click-ms <n>      Click ripple duration, default 400
   --cursor-size <n>          Cursor size in pixels (8-96), default 28
-  --cursor-motion <mode>     auto|always|off (auto honors prefers-reduced-motion)
+  --cursor-motion <mode>     auto|always|off (auto hides when effects are idle)
   --cursor-block-clicks      Await tween before clicks for strict visual fidelity
                              (default is fire-and-forget, no added click latency)
+  --click-sync <mode>        async (default) or block
+  --input-mode <mode>        fast (default) or animated
+  --input-delay-ms <n>       Delay between typed characters when animated
 
-The cursor overlay is recording-only, Chrome-only, and skipped on
-mobile-emulation viewports. Tuning flags imply the default `arrow` theme
-when used without `--cursor`. `--cursor` and `--no-cursor` together is
-a parse error.
+Click records cursor flight plus click ripple only. Use explicit `record zoom`
+and `record overlay` commands for presentation emphasis. Camera zoom is
+composited into captured frames and does not mutate page zoom or layout.
+Text overlays serialize and default to five seconds. Zoom holds until reset
+unless you pass --duration-ms for a temporary zoom.
+Tuning flags imply the default `arrow` theme when used without `--cursor`.
+`--cursor` and `--no-cursor` together is a parse error.
 
 Global Options:
   --json               Output as JSON
@@ -2463,6 +2479,12 @@ Examples:
 
   # Pick a different theme or tune timings
   agent-browser record start ./demo.webm --cursor dot --cursor-tween-ms 200
+
+  # Demo timing plus explicit overlay and zoom
+  agent-browser record start ./demo.webm --record-mode demo
+  agent-browser record overlay text "Choose a plan" --position bottom
+  agent-browser record zoom to @e4 --scale 1.45
+  agent-browser record zoom reset
 
   # Restart recording with a new file
   agent-browser record restart ./take2.webm
@@ -3285,7 +3307,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM); cursor overlay is ON
+  record start <path> [url]  Start video recording (WebM); compositor cursor is ON
                              by default (pass --no-cursor to disable)
   record stop                Stop and save video
   console [--clear]          View console logs

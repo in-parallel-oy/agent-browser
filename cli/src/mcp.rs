@@ -106,6 +106,8 @@ const TOOL_PROFILER_STOP: &str = "agent_browser_profiler_stop";
 const TOOL_RECORD_START: &str = "agent_browser_record_start";
 const TOOL_RECORD_STOP: &str = "agent_browser_record_stop";
 const TOOL_RECORD_RESTART: &str = "agent_browser_record_restart";
+const TOOL_RECORD_OVERLAY: &str = "agent_browser_record_overlay";
+const TOOL_RECORD_ZOOM: &str = "agent_browser_record_zoom";
 const TOOL_CONSOLE: &str = "agent_browser_console";
 const TOOL_ERRORS: &str = "agent_browser_errors";
 const TOOL_HIGHLIGHT: &str = "agent_browser_highlight";
@@ -1285,7 +1287,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_RECORD_START,
             "Record start",
             "Start video recording.",
-            json!({ "path": { "type": "string" }, "url": { "type": "string" } }),
+            recording_tool_properties(),
             &["path"],
         ),
         tool(
@@ -1299,8 +1301,33 @@ fn parity_tools() -> Vec<Value> {
             TOOL_RECORD_RESTART,
             "Record restart",
             "Restart video recording.",
-            json!({ "path": { "type": "string" }, "url": { "type": "string" } }),
+            recording_tool_properties(),
             &["path"],
+        ),
+        tool(
+            TOOL_RECORD_OVERLAY,
+            "Record overlay",
+            "Add or clear a recording overlay effect.",
+            json!({
+                "kind": { "type": "string", "enum": ["text", "spotlight", "clear"] },
+                "text": { "type": "string" },
+                "selector": { "type": "string" },
+                "position": { "type": "string", "enum": ["top", "center", "bottom"] },
+                "durationMs": { "type": "integer", "minimum": 0 }
+            }),
+            &["kind"],
+        ),
+        tool(
+            TOOL_RECORD_ZOOM,
+            "Record zoom",
+            "Apply or reset recording camera zoom.",
+            json!({
+                "mode": { "type": "string", "enum": ["to", "reset"] },
+                "selector": { "type": "string" },
+                "scale": { "type": "number" },
+                "durationMs": { "type": "integer", "minimum": 0 }
+            }),
+            &["mode"],
         ),
         tool(
             TOOL_CONSOLE,
@@ -1745,6 +1772,50 @@ fn key_schema() -> Value {
     })
 }
 
+fn recording_tool_properties() -> Value {
+    // `--record-fps` is intentionally CLI-only. MCP recordings keep the
+    // default capture cadence while preserving escape-hatch parity via
+    // `extraArgs` on every tool.
+    json!({
+        "path": { "type": "string" },
+        "url": { "type": "string" },
+        "recordEffects": {
+            "type": "string",
+            "enum": ["cursor", "demo", "off"],
+            "description": "Recording effects preset. Defaults to cursor."
+        },
+        "recordMode": {
+            "type": "string",
+            "enum": ["automation", "demo"],
+            "description": "automation keeps fast actions; demo blocks clicks visually and animates input."
+        },
+        "cursor": {
+            "type": "string",
+            "enum": ["arrow", "dot", "hand", "off"]
+        },
+        "cursorTweenMs": { "type": "integer", "minimum": 0 },
+        "cursorClickMs": { "type": "integer", "minimum": 0 },
+        "cursorSize": { "type": "integer", "minimum": 8, "maximum": 96 },
+        "cursorMotion": {
+            "type": "string",
+            "enum": ["auto", "always", "off"]
+        },
+        "clickSync": {
+            "type": "string",
+            "enum": ["async", "block"]
+        },
+        "cursorBlockClicks": {
+            "type": "boolean",
+            "description": "Compatibility alias for clickSync=block."
+        },
+        "inputMode": {
+            "type": "string",
+            "enum": ["fast", "animated"]
+        },
+        "inputDelayMs": { "type": "integer", "minimum": 0 }
+    })
+}
+
 fn mouse_button_schema() -> Value {
     json!({
         "type": "string",
@@ -2048,6 +2119,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_RECORD_START => call_record_start(arguments, "start"),
         TOOL_RECORD_STOP => call_literal(arguments, &["record", "stop"]),
         TOOL_RECORD_RESTART => call_record_start(arguments, "restart"),
+        TOOL_RECORD_OVERLAY => call_record_overlay(arguments),
+        TOOL_RECORD_ZOOM => call_record_zoom(arguments),
         TOOL_CONSOLE => call_clearable(arguments, "console"),
         TOOL_ERRORS => call_clearable(arguments, "errors"),
         TOOL_HIGHLIGHT => call_simple_selector(arguments, "highlight"),
@@ -2732,6 +2805,171 @@ fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolE
     let mut args = vec!["record".to_string(), action.to_string(), path];
     if let Some(url) = optional_string(arguments, "url")? {
         args.push(url);
+    }
+    if let Some(effects) = optional_string(arguments, "recordEffects")? {
+        if !matches!(effects.as_str(), "cursor" | "demo" | "off") {
+            return Err(ProtocolError::invalid_params(
+                "recordEffects must be one of cursor, demo, off",
+            ));
+        }
+        args.push("--record-effects".to_string());
+        args.push(effects);
+    }
+    if let Some(mode) = optional_string(arguments, "recordMode")? {
+        if !matches!(mode.as_str(), "automation" | "demo") {
+            return Err(ProtocolError::invalid_params(
+                "recordMode must be one of automation, demo",
+            ));
+        }
+        args.push("--record-mode".to_string());
+        args.push(mode);
+    }
+    if let Some(cursor) = optional_string(arguments, "cursor")? {
+        if !matches!(cursor.as_str(), "arrow" | "dot" | "hand" | "off") {
+            return Err(ProtocolError::invalid_params(
+                "cursor must be one of arrow, dot, hand, off",
+            ));
+        }
+        args.push("--cursor".to_string());
+        args.push(cursor);
+    }
+    append_optional_u64_arg(arguments, &mut args, "cursorTweenMs", "--cursor-tween-ms")?;
+    append_optional_u64_arg(arguments, &mut args, "cursorClickMs", "--cursor-click-ms")?;
+    append_optional_u64_arg(arguments, &mut args, "cursorSize", "--cursor-size")?;
+    if let Some(motion) = optional_string(arguments, "cursorMotion")? {
+        if !matches!(motion.as_str(), "auto" | "always" | "off") {
+            return Err(ProtocolError::invalid_params(
+                "cursorMotion must be one of auto, always, off",
+            ));
+        }
+        args.push("--cursor-motion".to_string());
+        args.push(motion);
+    }
+    if let Some(click_sync) = optional_string(arguments, "clickSync")? {
+        if !matches!(click_sync.as_str(), "async" | "block") {
+            return Err(ProtocolError::invalid_params(
+                "clickSync must be one of async, block",
+            ));
+        }
+        args.push("--click-sync".to_string());
+        args.push(click_sync);
+    }
+    if optional_bool(arguments, "cursorBlockClicks")?.unwrap_or(false) {
+        args.push("--cursor-block-clicks".to_string());
+    }
+    if let Some(input_mode) = optional_string(arguments, "inputMode")? {
+        if !matches!(input_mode.as_str(), "fast" | "animated") {
+            return Err(ProtocolError::invalid_params(
+                "inputMode must be one of fast, animated",
+            ));
+        }
+        args.push("--input-mode".to_string());
+        args.push(input_mode);
+    }
+    append_optional_u64_arg(arguments, &mut args, "inputDelayMs", "--input-delay-ms")?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn append_optional_u64_arg(
+    arguments: &Value,
+    args: &mut Vec<String>,
+    key: &str,
+    flag: &str,
+) -> Result<(), ProtocolError> {
+    if let Some(value) = optional_u64(arguments, key)? {
+        args.push(flag.to_string());
+        args.push(value.to_string());
+    }
+    Ok(())
+}
+
+fn call_record_overlay(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(
+        arguments,
+        record_overlay_args_from_arguments(arguments)?,
+        None,
+    )
+}
+
+fn record_overlay_args_from_arguments(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let kind = required_string(arguments, "kind")?;
+    let mut args = vec!["record".to_string(), "overlay".to_string(), kind.clone()];
+    match kind.as_str() {
+        "text" => args.push(required_string(arguments, "text")?),
+        "spotlight" => {
+            if arguments.get("position").is_some() {
+                return Err(ProtocolError::invalid_params(
+                    "position is only valid for record_overlay kind=text",
+                ));
+            }
+            if let Some(selector) = optional_string(arguments, "selector")? {
+                args.push(selector);
+            } else {
+                return Err(ProtocolError::invalid_params(
+                    "MCP coordinate spotlight is not supported by CLI adapter yet; pass selector",
+                ));
+            }
+        }
+        "clear" => {
+            if arguments.get("text").is_some()
+                || arguments.get("selector").is_some()
+                || arguments.get("position").is_some()
+                || arguments.get("durationMs").is_some()
+            {
+                return Err(ProtocolError::invalid_params(
+                    "record_overlay kind=clear does not accept text, selector, position, or durationMs",
+                ));
+            }
+        }
+        _ => {
+            return Err(ProtocolError::invalid_params(
+                "kind must be one of text, spotlight, clear",
+            ));
+        }
+    }
+    if let Some(position) = optional_string(arguments, "position")? {
+        args.push("--position".to_string());
+        args.push(position);
+    }
+    if let Some(duration) = optional_u64(arguments, "durationMs")? {
+        args.push("--duration-ms".to_string());
+        args.push(duration.to_string());
+    }
+    Ok(args)
+}
+
+fn call_record_zoom(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mode = required_string(arguments, "mode")?;
+    let mut args = vec!["record".to_string(), "zoom".to_string(), mode.clone()];
+    match mode.as_str() {
+        "to" => {
+            let selector = optional_string(arguments, "selector")?
+                .ok_or_else(|| ProtocolError::invalid_params("record zoom to requires selector"))?;
+            args.push(selector);
+        }
+        "reset" => {
+            if arguments.get("selector").is_some()
+                || arguments.get("scale").is_some()
+                || arguments.get("durationMs").is_some()
+            {
+                return Err(ProtocolError::invalid_params(
+                    "record_zoom mode=reset does not accept selector, scale, or durationMs",
+                ));
+            }
+        }
+        _ => {
+            return Err(ProtocolError::invalid_params(
+                "mode must be one of to, reset",
+            ))
+        }
+    }
+    if let Some(scale) = optional_number_string(arguments, "scale")? {
+        args.push("--scale".to_string());
+        args.push(scale);
+    }
+    if let Some(duration) = optional_u64(arguments, "durationMs")? {
+        args.push("--duration-ms".to_string());
+        args.push(duration.to_string());
     }
     call_cli_tool(arguments, args, None)
 }
@@ -3737,6 +3975,37 @@ mod tests {
         assert_eq!(
             open["inputSchema"]["properties"]["extraArgs"]["type"],
             "array"
+        );
+    }
+
+    #[test]
+    fn record_tool_schema_includes_effects_preset() {
+        let tools = tools();
+        let record = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_RECORD_START))
+            .unwrap();
+        let restart = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_RECORD_RESTART))
+            .unwrap();
+        assert_eq!(
+            record["inputSchema"]["properties"]["recordEffects"]["enum"],
+            json!(["cursor", "demo", "off"])
+        );
+        assert!(record["inputSchema"]["properties"]
+            .get("recordFps")
+            .is_none());
+        assert!(restart["inputSchema"]["properties"]
+            .get("recordFps")
+            .is_none());
+        assert_eq!(
+            record["inputSchema"]["properties"]["cursorBlockClicks"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            restart["inputSchema"]["properties"]["cursorBlockClicks"]["type"],
+            "boolean"
         );
     }
 

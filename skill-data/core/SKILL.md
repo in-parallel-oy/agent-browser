@@ -317,25 +317,25 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-A synthetic animated cursor is baked into the recording **by default**
-(the OS cursor isn't captured because frames come from
-`Page.captureScreenshot`). Override the theme with `--cursor <theme>`
-(`arrow`, `dot`, `hand`) or disable entirely with `--no-cursor`:
+A synthetic animated cursor is baked into the recording **by default** (the OS cursor isn't captured because frames come from `Page.captureScreenshot`). Use `--record-mode demo` for human-readable timing defaults: clicks wait for the cursor tween and fill/type actions animate with a short delay. Clicks do not zoom automatically; add emphasis with explicit `record overlay` and `record zoom` commands. Override the cursor theme with `--cursor <theme>` (`arrow`, `dot`, `hand`) or disable effects entirely with `--record-effects off`:
 
 ```bash
 # Default cursor (arrow)
 agent-browser record start demo.webm https://example.com
 
-# Disable for a clean recording
-agent-browser record start demo.webm --no-cursor
+# Demo timing with explicit presentation effects
+agent-browser record start demo.webm --record-mode demo
+agent-browser record overlay text "Choose a plan" --position bottom
+agent-browser record zoom to @e4 --scale 1.45
+
+# Disable effects for a clean recording
+agent-browser record start demo.webm --record-effects off
 
 # Different theme + tuning
 agent-browser record start demo.webm --cursor dot --cursor-tween-ms 350 --cursor-size 36
 ```
 
-See [references/video-recording.md](references/video-recording.md) for the
-full cursor flag set, sync-model trade-offs, codec options, GIF export, and
-other recording options.
+See [references/video-recording.md](references/video-recording.md) for the full cursor flag set, sync-model trade-offs, codec options, GIF export, and other recording options.
 
 ### Iframes
 

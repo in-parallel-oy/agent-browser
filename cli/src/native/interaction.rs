@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
-use super::cursor_overlay::{self, CursorBridge};
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use super::recording_effects::RecordingEffectsHandle;
 
 /// Click-specific options that don't apply to other mouse interactions
 /// (hover, check, uncheck). Bundling them keeps `click` at a sensible arg
@@ -14,15 +14,19 @@ use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 pub struct ClickOptions<'a> {
     pub button: &'a str,
     pub click_count: i32,
-    pub cursor: Option<&'a CursorBridge>,
+    pub effects: Option<&'a RecordingEffectsHandle>,
 }
 
 impl<'a> ClickOptions<'a> {
-    pub fn new(button: &'a str, click_count: i32, cursor: Option<&'a CursorBridge>) -> Self {
+    pub fn new(
+        button: &'a str,
+        click_count: i32,
+        effects: Option<&'a RecordingEffectsHandle>,
+    ) -> Self {
         Self {
             button,
             click_count,
-            cursor,
+            effects,
         }
     }
 }
@@ -73,7 +77,7 @@ pub async fn click(
         y,
         options.button,
         options.click_count,
-        options.cursor,
+        options.effects,
     )
     .await
 }
@@ -84,7 +88,7 @@ pub async fn dblclick(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-    cursor: Option<&CursorBridge>,
+    effects: Option<&RecordingEffectsHandle>,
 ) -> Result<ClickResult, String> {
     click(
         client,
@@ -92,7 +96,7 @@ pub async fn dblclick(
         ref_map,
         selector_or_ref,
         iframe_sessions,
-        ClickOptions::new("left", 2, cursor),
+        ClickOptions::new("left", 2, effects),
     )
     .await
 }
@@ -103,7 +107,7 @@ pub async fn hover(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-    cursor: Option<&CursorBridge>,
+    effects: Option<&RecordingEffectsHandle>,
 ) -> Result<(), String> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
@@ -113,13 +117,8 @@ pub async fn hover(
         iframe_sessions,
     )
     .await?;
-    // When the cursor overlay is active, animate it toward the hover target
-    // before the real `mouseMoved` so the recording captures the motion. The
-    // tween is fire-and-forget on hover -- blocking would add latency without
-    // a corresponding visual benefit.
-    if let Some(b) = cursor {
-        let _ =
-            cursor_overlay::move_async(&b.client, &effective_session_id, x, y, b.tween_ms).await;
+    if let Some(effects) = effects {
+        effects.move_to(x, y).await;
     }
     client
         .send_command_typed::<_, Value>(
@@ -522,7 +521,7 @@ pub async fn check(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-    cursor: Option<&CursorBridge>,
+    effects: Option<&RecordingEffectsHandle>,
 ) -> Result<(), String> {
     let is_checked = super::element::is_element_checked(
         client,
@@ -539,7 +538,7 @@ pub async fn check(
             ref_map,
             selector_or_ref,
             iframe_sessions,
-            ClickOptions::new("left", 1, cursor),
+            ClickOptions::new("left", 1, effects),
         )
         .await?;
 
@@ -574,7 +573,7 @@ pub async fn uncheck(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-    cursor: Option<&CursorBridge>,
+    effects: Option<&RecordingEffectsHandle>,
 ) -> Result<(), String> {
     let is_checked = super::element::is_element_checked(
         client,
@@ -591,7 +590,7 @@ pub async fn uncheck(
             ref_map,
             selector_or_ref,
             iframe_sessions,
-            ClickOptions::new("left", 1, cursor),
+            ClickOptions::new("left", 1, effects),
         )
         .await?;
 
@@ -1025,21 +1024,10 @@ async fn dispatch_click(
     y: f64,
     button: &str,
     click_count: i32,
-    cursor: Option<&CursorBridge>,
+    effects: Option<&RecordingEffectsHandle>,
 ) -> Result<ClickResult, String> {
-    // When the cursor overlay is active, kick off the tween toward the click
-    // target. Default is fire-and-forget (no added click latency); when the
-    // user passes `--cursor-block-clicks`, await the tween for strict visual
-    // fidelity at the cost of ~tween_ms per click.
-    if let Some(b) = cursor {
-        if b.block_clicks {
-            // move_blocking takes a plain `&CdpClient` because it doesn't
-            // spawn -- it just steps the tween in the calling task.
-            let _ = cursor_overlay::move_blocking(client, session_id, x, y, b.tween_ms).await;
-        } else {
-            // move_async needs the Arc to spawn a background stepping task.
-            let _ = cursor_overlay::move_async(&b.client, session_id, x, y, b.tween_ms).await;
-        }
+    if let Some(effects) = effects {
+        effects.click_before_dispatch(x, y).await;
     }
 
     // Move
@@ -1105,13 +1093,6 @@ async fn dispatch_click(
                 button: button.to_string(),
             }),
         });
-    }
-
-    // Trigger the click ripple right after the press so the visual lands on
-    // the same frame the page sees the click. Fire-and-forget; the ripple
-    // animates over ~150 ms regardless.
-    if let Some(b) = cursor {
-        let _ = cursor_overlay::click_pulse(&b.client, session_id, x, y, b.click_ms).await;
     }
 
     // Release. A dialog here fired from the click/mouseup handler, which runs

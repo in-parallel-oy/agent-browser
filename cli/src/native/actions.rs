@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::sync::{broadcast, oneshot, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use crate::connection::get_socket_dir;
 
@@ -30,6 +30,10 @@ use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
 use super::recording::{self, RecordingState};
+use super::recording_effects::{
+    InputMode, OverlayPosition, RecordEffectsPreset, RecordingEffectsConfig,
+    RecordingEffectsHandle, RecordingEffectsState,
+};
 use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
@@ -277,10 +281,8 @@ pub struct DaemonState {
     pub viewport: Option<(i32, i32, f64, bool)>,
     /// Cursor overlay configuration for the active recording, if any. `None`
     /// when no recording is active or `--cursor` was not passed.
-    pub cursor_overlay: Option<super::cursor_overlay::CursorOverlayConfig>,
-    /// Identifier returned by `Page.addScriptToEvaluateOnNewDocument` when
-    /// the cursor overlay is installed. Cleared by `record stop`/`restart`.
-    pub cursor_script_id: Option<String>,
+    /// Recording-scoped effects timeline used by cursor/demo recording modes.
+    pub recording_effects: Option<Arc<Mutex<RecordingEffectsState>>>,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -345,24 +347,18 @@ impl DaemonState {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(25_000),
             viewport: None,
-            cursor_overlay: None,
-            cursor_script_id: None,
+            recording_effects: None,
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             confirmed_policy_actions: HashSet::new(),
         }
     }
 
-    /// Build a copyable bridge view of the active cursor configuration, but
-    /// only if the cursor overlay is currently installed on a recording
-    /// session. Returns `None` otherwise -- the click/hover hooks then skip
-    /// every cursor-related call entirely (zero-cost for non-recording
-    /// sessions).
-    pub fn cursor_bridge(&self) -> Option<super::cursor_overlay::CursorBridge> {
-        self.cursor_script_id.as_ref()?;
-        let cfg = self.cursor_overlay.as_ref()?;
-        let client = self.browser.as_ref()?.client.clone();
-        Some(cfg.bridge(client))
+    pub fn recording_effects_handle(&self) -> Option<RecordingEffectsHandle> {
+        let shared = self.recording_effects.as_ref()?;
+        Some(RecordingEffectsHandle {
+            shared: Arc::clone(shared),
+        })
     }
 
     /// Extract the timeout from a command JSON, falling back to the
@@ -608,6 +604,7 @@ impl DaemonState {
         &mut self,
         client: Arc<CdpClient>,
         session_id: String,
+        effects: Option<Arc<Mutex<RecordingEffectsState>>>,
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -618,6 +615,7 @@ impl DaemonState {
             self.recording_state.fps,
             shared_count.clone(),
             cancel_rx,
+            effects,
         );
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
@@ -626,6 +624,19 @@ impl DaemonState {
     }
 
     async fn stop_recording_task(&mut self) -> Result<(), String> {
+        let mut post_roll = self.recording_state.stop_post_roll;
+        if let Some(ref effects) = self.recording_effects {
+            let effects_post_roll = effects
+                .lock()
+                .await
+                .stop_post_roll_duration(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(3_000));
+            post_roll = post_roll.max(effects_post_roll);
+        }
+        post_roll = post_roll.min(std::time::Duration::from_millis(4_500));
+        if !post_roll.is_zero() {
+            tokio::time::sleep(post_roll).await;
+        }
         recording::stop_recording_task(&mut self.recording_state).await
     }
 
@@ -1610,6 +1621,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "recording_start" => handle_recording_start(cmd, state).await,
         "recording_stop" => handle_recording_stop(state).await,
         "recording_restart" => handle_recording_restart(cmd, state).await,
+        "recording_overlay" => handle_recording_overlay(cmd, state).await,
+        "recording_zoom" => handle_recording_zoom(cmd, state).await,
         "pdf" => handle_pdf(cmd, state).await,
         "tab_list" => handle_tab_list(state).await,
         "tab_new" => handle_tab_new(cmd, state).await,
@@ -3027,14 +3040,14 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     let result = interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        interaction::ClickOptions::new(button, click_count, cursor.as_ref()),
+        interaction::ClickOptions::new(button, click_count, effects.as_ref()),
     )
     .await?;
 
@@ -3053,14 +3066,14 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     let result = interaction::dblclick(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        cursor.as_ref(),
+        effects.as_ref(),
     )
     .await?;
     if result.dialog_opened {
@@ -3089,16 +3102,34 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let (effects, input_mode, input_delay_ms) = recording_input_behavior(state).await;
 
-    interaction::fill(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        value,
-        &state.iframe_sessions,
-    )
-    .await?;
+    if matches!(input_mode, InputMode::Animated) {
+        interaction::type_text(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            value,
+            true,
+            Some(input_delay_ms),
+            &state.iframe_sessions,
+        )
+        .await?;
+    } else {
+        interaction::fill(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            value,
+            &state.iframe_sessions,
+        )
+        .await?;
+    }
+    if let Some(effects) = effects {
+        effects.key(value.to_string()).await;
+    }
     Ok(json!({ "filled": selector }))
 }
 
@@ -3115,6 +3146,14 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         .ok_or("Missing 'text' parameter")?;
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
+    let (effects, input_mode, input_delay_ms) = recording_input_behavior(state).await;
+    let delay = delay.or_else(|| {
+        if matches!(input_mode, InputMode::Animated) {
+            Some(input_delay_ms)
+        } else {
+            None
+        }
+    });
 
     interaction::type_text(
         &mgr.client,
@@ -3127,10 +3166,14 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         &state.iframe_sessions,
     )
     .await?;
+    if let Some(effects) = effects {
+        effects.key(text.to_string()).await;
+    }
     Ok(json!({ "typed": text }))
 }
 
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
@@ -3142,7 +3185,25 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let (actual_key, modifiers) = parse_key_chord(key);
 
     interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
+    if let Some(effects) = effects {
+        effects.key(key.to_string()).await;
+    }
     Ok(json!({ "pressed": key }))
+}
+
+async fn recording_input_behavior(
+    state: &DaemonState,
+) -> (Option<RecordingEffectsHandle>, InputMode, u64) {
+    let Some(ref effects) = state.recording_effects else {
+        return (None, InputMode::Fast, 0);
+    };
+    let guard = effects.lock().await;
+    let cfg = guard.config();
+    (
+        state.recording_effects_handle(),
+        cfg.input_mode,
+        cfg.input_delay_ms,
+    )
 }
 
 /// Parse a key chord string like "Control+a" or "Control+Shift+Enter" into
@@ -3193,14 +3254,14 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     interaction::hover(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        cursor.as_ref(),
+        effects.as_ref(),
     )
     .await?;
     Ok(json!({ "hovered": selector }))
@@ -3281,14 +3342,14 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     interaction::check(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        cursor.as_ref(),
+        effects.as_ref(),
     )
     .await?;
     Ok(json!({ "checked": selector }))
@@ -3302,14 +3363,14 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     interaction::uncheck(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        cursor.as_ref(),
+        effects.as_ref(),
     )
     .await?;
     Ok(json!({ "unchecked": selector }))
@@ -4073,6 +4134,7 @@ async fn handle_auth_show(cmd: &Value) -> Result<Value, String> {
 }
 
 async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -4084,6 +4146,14 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     let y = cmd.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("none");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    if let Some(effects) = effects {
+        match event_type {
+            "mousePressed" => effects.click_before_dispatch(x, y).await,
+            "mouseMoved" => effects.move_to(x, y).await,
+            _ => {}
+        }
+    }
 
     mgr.client
         .send_command(
@@ -4103,6 +4173,7 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 }
 
 async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -4114,6 +4185,9 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .ok_or("Missing 'text' parameter")?;
             interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
                 .await?;
+            if let Some(effects) = effects {
+                effects.key(text.to_string()).await;
+            }
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -4128,6 +4202,9 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                     Some(&session_id),
                 )
                 .await?;
+            if let Some(effects) = effects {
+                effects.key(text.to_string()).await;
+            }
             return Ok(json!({ "inserted": true }));
         }
         _ => {}
@@ -4150,6 +4227,13 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
     }
     if let Some(t) = text {
         params["text"] = Value::String(t.to_string());
+    }
+
+    if let Some(effects) = effects {
+        if matches!(event_type, "keyDown" | "char") {
+            let label = text.or(key).unwrap_or(event_type).to_string();
+            effects.key(label).await;
+        }
     }
 
     mgr.client
@@ -4241,6 +4325,9 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     mgr.set_viewport(width, height, scale, mobile).await?;
 
     state.viewport = Some((width, height, scale, mobile));
+    if let Some(ref effects) = state.recording_effects {
+        effects.lock().await.set_device_scale_factor(scale);
+    }
 
     // Update stream server viewport so status messages and screencast use the new dimensions
     if let Some(ref server) = state.stream_server {
@@ -4341,14 +4428,14 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let mut rx = mgr.client.subscribe();
 
     // Click the element to trigger the download
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
-        interaction::ClickOptions::new("left", 1, cursor.as_ref()),
+        interaction::ClickOptions::new("left", 1, effects.as_ref()),
     )
     .await?;
 
@@ -4508,13 +4595,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     };
     state.recording_state.fps = fps;
 
-    // Parse optional cursor overlay config. Absence = cursor disabled. Errors
-    // here surface to the user before the recording context is created so a
-    // typo'd `--cursor` value doesn't silently produce a cursor-less video.
-    let cursor_config = match cmd.get("cursor") {
-        Some(v) => super::cursor_overlay::CursorOverlayConfig::from_cmd_value(v)?,
-        None => None,
-    };
+    let effects_config = recording_effects_config_from_cmd(cmd)?;
 
     let (client, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -4652,37 +4733,12 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         (mgr.client.clone(), new_session_id)
     };
 
-    // Install the cursor overlay (if requested) on the new recording session,
-    // before the capture task starts piping frames. Skip on non-Chrome engines
-    // and on mobile-emulation viewports per the plan; failures here are
-    // logged and the recording continues without a cursor (graceful
-    // degradation -- the rest of the recording is still useful).
-    state.cursor_overlay = None;
-    state.cursor_script_id = None;
-    if let Some(cfg) = cursor_config {
-        let is_mobile = state.viewport.map(|(_, _, _, m)| m).unwrap_or(false);
-        if state.engine != "chrome" {
-            eprintln!(
-                "agent-browser: cursor overlay disabled (engine={}); only Chrome is supported in v1",
-                state.engine
-            );
-        } else if is_mobile {
-            eprintln!("agent-browser: cursor overlay disabled (mobile viewport)");
-        } else {
-            match super::cursor_overlay::install(&client, &new_session_id, &cfg).await {
-                Ok(id) => {
-                    state.cursor_overlay = Some(cfg);
-                    state.cursor_script_id = Some(id);
-                }
-                Err(e) => {
-                    eprintln!("agent-browser: cursor overlay install failed: {}", e);
-                }
-            }
-        }
-    }
+    let effects = setup_recording_effects(state, effects_config).await;
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
-    state.start_recording_task(client, new_session_id).await?;
+    state
+        .start_recording_task(client, new_session_id, effects)
+        .await?;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
@@ -4692,30 +4748,16 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 }
 
 async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String> {
-    state.stop_recording_task().await?;
+    let task_result = state.stop_recording_task().await;
     let result = recording::recording_stop(&mut state.recording_state);
 
-    // Tear down the cursor overlay, if any. Best-effort: a remove failure
-    // (e.g., page already closed) is logged and the script id is cleared
-    // either way so a subsequent record-start gets a clean slate.
-    if let Some(id) = state.cursor_script_id.take() {
-        if let Some(ref browser) = state.browser {
-            if let Ok(session_id) = browser.active_session_id() {
-                let session_id = session_id.to_string();
-                if let Err(e) =
-                    super::cursor_overlay::remove(&browser.client, &session_id, &id).await
-                {
-                    eprintln!("agent-browser: cursor overlay remove failed: {}", e);
-                }
-            }
-        }
-    }
-    state.cursor_overlay = None;
+    clear_recording_effects(state).await;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(false, &state.engine).await;
     }
 
+    task_result?;
     result
 }
 
@@ -4740,24 +4782,9 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
 
     let _ = state.stop_recording_task().await;
 
-    // `record restart` re-uses the same browser session, so the previous
-    // overlay script registration (and DOM host) is still alive. Remove
-    // before the new recording_restart kicks the capture task -- otherwise
-    // a re-install would double-mount and a second cursor would appear.
-    if let Some(id) = state.cursor_script_id.take() {
-        if let Some(ref browser) = state.browser {
-            if let Ok(session_id) = browser.active_session_id() {
-                let session_id = session_id.to_string();
-                let _ = super::cursor_overlay::remove(&browser.client, &session_id, &id).await;
-            }
-        }
-    }
-    state.cursor_overlay = None;
+    clear_recording_effects(state).await;
 
-    let cursor_config = match cmd.get("cursor") {
-        Some(v) => super::cursor_overlay::CursorOverlayConfig::from_cmd_value(v)?,
-        None => None,
-    };
+    let effects_config = recording_effects_config_from_cmd(cmd)?;
 
     let previous_path = if state.recording_state.active {
         recording::recording_stop(&mut state.recording_state)
@@ -4780,22 +4807,11 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     recording::recording_start(&mut state.recording_state, path)?;
 
     if let Some((client, session_id)) = recording_target {
-        if let Some(cfg) = cursor_config {
-            match super::cursor_overlay::install(&client, &session_id, &cfg).await {
-                Ok(id) => {
-                    state.cursor_overlay = Some(cfg);
-                    state.cursor_script_id = Some(id);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "agent-browser: cursor overlay re-install on restart failed: {}",
-                        e
-                    );
-                }
-            }
-        }
+        let effects = setup_recording_effects(state, effects_config).await;
 
-        state.start_recording_task(client, session_id).await?;
+        state
+            .start_recording_task(client, session_id, effects)
+            .await?;
     }
 
     Ok(json!({
@@ -4803,6 +4819,143 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         "previousPath": previous_path,
         "path": path,
     }))
+}
+
+async fn setup_recording_effects(
+    state: &mut DaemonState,
+    effects_config: Option<RecordingEffectsConfig>,
+) -> Option<Arc<Mutex<RecordingEffectsState>>> {
+    let device_scale_factor = state.viewport.map(|(_, _, scale, _)| scale).unwrap_or(1.0);
+    let effects = effects_config
+        .map(|config| {
+            let mut effects_state = RecordingEffectsState::new(config);
+            effects_state.set_device_scale_factor(device_scale_factor);
+            effects_state
+        })
+        .map(|state| Arc::new(Mutex::new(state)));
+    state.recording_effects = effects.clone();
+    effects
+}
+
+fn recording_effects_config_from_cmd(
+    cmd: &Value,
+) -> Result<Option<RecordingEffectsConfig>, String> {
+    let effects_preset = match cmd.get("effects").and_then(|v| v.as_str()) {
+        Some(v) => RecordEffectsPreset::from_str(v)?,
+        None if cmd.get("cursor").is_some() => RecordEffectsPreset::Cursor,
+        None => RecordEffectsPreset::Cursor,
+    };
+    RecordingEffectsConfig::from_cmd(
+        effects_preset,
+        cmd.get("cursor"),
+        cmd.get("recordMode").and_then(|v| v.as_str()),
+        cmd.get("clickSync").and_then(|v| v.as_str()),
+        cmd.get("inputMode").and_then(|v| v.as_str()),
+        cmd.get("inputDelayMs").and_then(|v| v.as_u64()),
+    )
+}
+
+async fn clear_recording_effects(state: &mut DaemonState) {
+    state.recording_effects = None;
+    state.recording_state.stop_post_roll = std::time::Duration::ZERO;
+}
+
+async fn handle_recording_overlay(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state
+        .recording_effects
+        .as_ref()
+        .ok_or("Recording effects are not enabled. Start recording with cursor or demo effects.")?
+        .clone();
+    let kind = cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("text");
+    match kind {
+        "text" => {
+            let text = cmd
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'text' parameter")?;
+            let position = OverlayPosition::from_str(
+                cmd.get("position")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("bottom"),
+            )?;
+            let duration_ms = cmd
+                .get("durationMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5_000);
+            effects
+                .lock()
+                .await
+                .overlay_text(text.to_string(), position, duration_ms);
+            Ok(json!({ "overlay": "text" }))
+        }
+        "spotlight" => {
+            let (x, y) = recording_point_from_cmd(cmd, state).await?;
+            let duration_ms = cmd
+                .get("durationMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1_200);
+            effects.lock().await.spotlight(x, y, duration_ms);
+            Ok(json!({ "overlay": "spotlight", "x": x, "y": y }))
+        }
+        "clear" => {
+            effects.lock().await.clear_overlay();
+            Ok(json!({ "overlay": "cleared" }))
+        }
+        other => Err(format!(
+            "unknown recording overlay kind '{}'; valid options: text, spotlight, clear",
+            other
+        )),
+    }
+}
+
+async fn handle_recording_zoom(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state
+        .recording_effects
+        .as_ref()
+        .ok_or("Recording effects are not enabled. Start recording with cursor or demo effects.")?
+        .clone();
+    let mode = cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("to");
+    match mode {
+        "to" => {
+            let (x, y) = recording_point_from_cmd(cmd, state).await?;
+            let scale = cmd.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.45);
+            let duration_ms = cmd.get("durationMs").and_then(|v| v.as_u64());
+            effects.lock().await.zoom_to(x, y, scale, duration_ms);
+            Ok(json!({ "zoom": "to", "x": x, "y": y, "scale": scale }))
+        }
+        "reset" => {
+            effects.lock().await.zoom_reset();
+            Ok(json!({ "zoom": "reset" }))
+        }
+        other => Err(format!(
+            "unknown recording zoom mode '{}'; valid options: to, reset",
+            other
+        )),
+    }
+}
+
+async fn recording_point_from_cmd(cmd: &Value, state: &DaemonState) -> Result<(f64, f64), String> {
+    if let (Some(x), Some(y)) = (
+        cmd.get("x").and_then(|v| v.as_f64()),
+        cmd.get("y").and_then(|v| v.as_f64()),
+    ) {
+        return Ok((x, y));
+    }
+    let selector = cmd
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'selector' or x/y parameters")?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let (x, y, _) = super::element::resolve_element_center(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await?;
+    Ok((x, y))
 }
 
 async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -6231,7 +6384,7 @@ async fn execute_subaction(
         .unwrap_or("click");
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
 
     match subaction {
         "click" => {
@@ -6241,7 +6394,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
-                interaction::ClickOptions::new("left", 1, cursor.as_ref()),
+                interaction::ClickOptions::new("left", 1, effects.as_ref()),
             )
             .await?;
             if result.dialog_opened {
@@ -6273,7 +6426,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
-                cursor.as_ref(),
+                effects.as_ref(),
             )
             .await?;
             Ok(json!({ "checked": selector }))
@@ -6285,7 +6438,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
-                cursor.as_ref(),
+                effects.as_ref(),
             )
             .await?;
             Ok(json!({ "hovered": selector }))
@@ -7093,7 +7246,7 @@ async fn handle_video_start(cmd: &Value, state: &mut DaemonState) -> Result<Valu
 
     recording::recording_start(&mut state.recording_state, path)?;
     state
-        .start_recording_task(mgr.client.clone(), session_id)
+        .start_recording_task(mgr.client.clone(), session_id, None)
         .await?;
 
     Ok(json!({
@@ -8199,10 +8352,10 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         ..
     } = cred;
 
-    // Capture cursor bridge before the mutable borrow on `state.browser` --
-    // both `mgr` (mutable) and `state.cursor_bridge()` (immutable) would
+    // Capture the recording effects handle before the mutable borrow on `state.browser` --
+    // both `mgr` (mutable) and `state.recording_effects_handle()` (immutable) would
     // otherwise conflict.
-    let cursor = state.cursor_bridge();
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     mgr.navigate(&url, AUTH_LOGIN_WAIT_UNTIL).await?;
 
@@ -8355,7 +8508,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &state.ref_map,
         &sub_sel,
         &state.iframe_sessions,
-        interaction::ClickOptions::new("left", 1, cursor.as_ref()),
+        interaction::ClickOptions::new("left", 1, effects.as_ref()),
     )
     .await?;
 
@@ -8650,8 +8803,11 @@ fn build_mouse_event_params(
 }
 
 async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let effects = state.recording_effects_handle();
+    let (client, session_id) = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        (mgr.client.clone(), mgr.active_session_id()?.to_string())
+    };
     let event_type = cmd
         .get("type")
         .and_then(|v| v.as_str())
@@ -8675,13 +8831,24 @@ async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Valu
             .map(|v| v as i32),
     );
 
-    mgr.client
+    if let Some(effects) = effects {
+        match event_type {
+            "mousePressed" => {
+                effects.click_before_dispatch(params.x, params.y).await;
+            }
+            "mouseMoved" => effects.move_to(params.x, params.y).await,
+            _ => {}
+        }
+    }
+
+    client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
     Ok(json!({ "dispatched": event_type }))
 }
 
 async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let event_type = cmd
@@ -8693,6 +8860,18 @@ async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value
     for key in &["key", "code", "text"] {
         if let Some(v) = cmd.get(*key) {
             params[*key] = v.clone();
+        }
+    }
+
+    if let Some(effects) = effects {
+        if matches!(event_type, "keyDown" | "char") {
+            let label = cmd
+                .get("text")
+                .or_else(|| cmd.get("key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(event_type)
+                .to_string();
+            effects.key(label).await;
         }
     }
 
@@ -8724,12 +8903,16 @@ async fn handle_input_touch(cmd: &Value, state: &DaemonState) -> Result<Value, S
 }
 
 async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
         .get("key")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
+    if let Some(effects) = effects {
+        effects.key(key.to_string()).await;
+    }
 
     mgr.client
         .send_command(
@@ -8760,12 +8943,16 @@ async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 }
 
 async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let effects = state.recording_effects_handle();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let text = cmd
         .get("text")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'text' parameter")?;
+    if let Some(effects) = effects {
+        effects.key(text.to_string()).await;
+    }
 
     mgr.client
         .send_command(
@@ -8778,8 +8965,11 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
 }
 
 async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let effects = state.recording_effects_handle();
+    let (client, session_id) = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        (mgr.client.clone(), mgr.active_session_id()?.to_string())
+    };
     let x = cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let y = cmd.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let params = build_mouse_event_params(
@@ -8794,16 +8984,21 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         None,
         None,
     );
-
-    mgr.client
+    if let Some(effects) = effects {
+        effects.move_to(params.x, params.y).await;
+    }
+    client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
     Ok(json!({ "moved": true }))
 }
 
 async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let effects = state.recording_effects_handle();
+    let (client, session_id) = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        (mgr.client.clone(), mgr.active_session_id()?.to_string())
+    };
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let params = build_mouse_event_params(
         &mut state.mouse_state,
@@ -8817,16 +9012,21 @@ async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         None,
         None,
     );
+    if let Some(effects) = effects {
+        effects.click_before_dispatch(params.x, params.y).await;
+    }
 
-    mgr.client
+    client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
     Ok(json!({ "pressed": true }))
 }
 
 async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let (client, session_id) = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        (mgr.client.clone(), mgr.active_session_id()?.to_string())
+    };
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let params = build_mouse_event_params(
         &mut state.mouse_state,
@@ -8841,7 +9041,7 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         None,
     );
 
-    mgr.client
+    client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
     Ok(json!({ "released": true }))

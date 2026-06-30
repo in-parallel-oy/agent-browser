@@ -133,6 +133,9 @@ agent-browser screenshot [path]       # Take screenshot (--full for full page, s
 agent-browser screenshot --annotate   # Annotated screenshot with numbered element labels
 agent-browser screenshot --screenshot-dir ./shots    # Save to custom directory
 agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
+agent-browser record start ./demo.webm # Record automation as video, cursor included by default
+agent-browser record start ./demo.webm --record-mode demo # Demo timing and animated input
+agent-browser record stop             # Stop recording and save video
 agent-browser pdf <path>              # Save as PDF
 agent-browser snapshot                # Accessibility tree with refs (best for AI)
 agent-browser eval <js>               # Run JavaScript (-b for base64, --stdin for piped input)
@@ -814,6 +817,23 @@ agent-browser snapshot -i -c -d 5         # Combine options
 | `-c, --compact`        | Remove empty structural elements                                        |
 | `-d, --depth <n>`      | Limit tree depth                                                        |
 | `-s, --selector <sel>` | Scope to CSS selector                                                   |
+
+## Video Recording
+
+The `record` command captures browser automation as WebM video. The default `cursor` effects preset renders a synthetic cursor because CDP screenshots do not include the OS cursor. Use `--record-mode demo` for presentation timing defaults: clicks wait for the cursor tween and fill/type actions animate with a short per-character delay. Zoom and overlay effects are explicit commands so normal clicks remain cursor flight plus click ripple only.
+
+```bash
+agent-browser open https://app.example.com
+agent-browser record start ./demo.webm --record-mode demo
+agent-browser record overlay text "Choose a plan" --position bottom
+agent-browser record zoom to @e1 --scale 1.45
+agent-browser click @e1
+agent-browser keyboard type "hello"
+agent-browser record zoom reset
+agent-browser record stop
+```
+
+Use `--record-effects off` or `--no-cursor` for a clean recording without synthetic effects. Use `--cursor off` to keep the compositor available for explicit zoom/overlay effects while hiding the cursor. Text overlays serialize and default to five seconds when no duration is supplied. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. Existing cursor tuning flags such as `--cursor dot`, `--cursor-tween-ms`, and `--cursor-click-ms` still work for advanced cursor styling. The default `--cursor-motion auto` renders the cursor during effect activity; use `--cursor-motion always` when you want the cursor to remain visible while idle.
 
 ## Annotated Screenshots
 
