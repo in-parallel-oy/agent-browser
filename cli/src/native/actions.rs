@@ -610,9 +610,10 @@ impl DaemonState {
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let capture_session = Arc::new(tokio::sync::RwLock::new(session_id));
         let handle = recording::spawn_recording_task(
             client,
-            session_id,
+            capture_session.clone(),
             self.recording_state.output_path.clone(),
             self.recording_state.fps,
             shared_count.clone(),
@@ -622,6 +623,7 @@ impl DaemonState {
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
         self.recording_state.cancel_tx = Some(cancel_tx);
+        self.recording_state.capture_session = Some(capture_session);
         Ok(())
     }
 
@@ -663,6 +665,21 @@ impl DaemonState {
             duration = duration.max(effect_duration);
         }
         gate.activate_for(duration).await;
+    }
+
+    async fn retarget_recording_to_active_page(&mut self) -> Result<(), String> {
+        let (client, session_id) = active_recording_target(self)?;
+        if let Some(ref capture_session) = self.recording_state.capture_session {
+            *capture_session.write().await = session_id.clone();
+        }
+        if let Some(ref effects) = self.recording_effects {
+            RecordingEffectsHandle {
+                shared: effects.clone(),
+            }
+            .retarget(client, session_id)
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn drain_cdp_events_background(&mut self) {
@@ -1829,14 +1846,12 @@ async fn activate_demo_recording_for_action(action: &str, cmd: &Value, state: &D
     state.activate_demo_recording_for(duration).await;
 }
 
-async fn extend_demo_recording_after_action(action: &str, state: &DaemonState) {
+async fn extend_demo_recording_after_action(action: &str, state: &mut DaemonState) {
     if state.recording_state.capture_gate.is_none() || !demo_recording_action_is_visual(action) {
         return;
     }
     if demo_recording_action_may_replace_document(action) {
-        if let Some(effects) = state.recording_effects_handle() {
-            let _ = effects.refresh_current_document().await;
-        }
+        let _ = state.retarget_recording_to_active_page().await;
     }
     state.extend_demo_recording_from_effects().await;
 }
@@ -1890,7 +1905,18 @@ fn demo_recording_action_is_visual(action: &str) -> bool {
 fn demo_recording_action_may_replace_document(action: &str) -> bool {
     matches!(
         action,
-        "navigate" | "back" | "forward" | "reload" | "tab_new" | "tab_switch"
+        "navigate"
+            | "back"
+            | "forward"
+            | "reload"
+            | "tab_new"
+            | "tab_switch"
+            | "click"
+            | "dblclick"
+            | "tap"
+            | "press"
+            | "keyboard"
+            | "input_keyboard"
     )
 }
 

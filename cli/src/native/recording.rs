@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{CaptureScreenshotParams, CaptureScreenshotResult};
@@ -30,6 +30,7 @@ pub struct RecordingState {
     pub cancel_tx: Option<oneshot::Sender<()>>,
     pub stop_post_roll: Duration,
     pub capture_gate: Option<Arc<RecordingCaptureGate>>,
+    pub capture_session: Option<Arc<RwLock<String>>>,
 }
 
 impl RecordingState {
@@ -44,6 +45,7 @@ impl RecordingState {
             cancel_tx: None,
             stop_post_roll: Duration::ZERO,
             capture_gate: None,
+            capture_session: None,
         }
     }
 }
@@ -121,6 +123,7 @@ pub fn recording_start(state: &mut RecordingState, path: &str) -> Result<Value, 
     state.output_path = path.to_string();
     state.frame_count = 0;
     state.capture_gate = None;
+    state.capture_session = None;
 
     Ok(json!({ "started": true, "path": path }))
 }
@@ -132,6 +135,7 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
 
     state.active = false;
     state.capture_gate = None;
+    state.capture_session = None;
 
     if state.frame_count == 0 {
         return Err("No frames captured".to_string());
@@ -228,7 +232,7 @@ pub(crate) fn due_frame_count(
 /// and pipes them to ffmpeg in real-time.
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
-    session_id: String,
+    session_id: Arc<RwLock<String>>,
     output_path: String,
     fps: u32,
     shared_count: Arc<AtomicU64>,
@@ -291,8 +295,9 @@ pub fn spawn_recording_task(
                 }
             }
 
+            let current_session_id = session_id.read().await.clone();
             let result: Result<CaptureScreenshotResult, _> = client
-                .send_command_typed("Page.captureScreenshot", &params, Some(&session_id))
+                .send_command_typed("Page.captureScreenshot", &params, Some(&current_session_id))
                 .await;
 
             let screenshot = match result {

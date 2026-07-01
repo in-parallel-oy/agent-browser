@@ -355,6 +355,12 @@ struct RecordingEffectsTarget {
     session_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct RecordingEffectsInitScript {
+    target: RecordingEffectsTarget,
+    identifier: String,
+}
+
 impl std::fmt::Debug for RecordingEffectsTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingEffectsTarget")
@@ -367,7 +373,7 @@ impl std::fmt::Debug for RecordingEffectsTarget {
 pub struct RecordingEffectsState {
     config: RecordingEffectsConfig,
     target: Option<RecordingEffectsTarget>,
-    init_script_identifier: Option<String>,
+    init_scripts: Vec<RecordingEffectsInitScript>,
     overlay_chain_until: Option<Instant>,
     effect_active_until: Option<Instant>,
     runtime_installed: bool,
@@ -381,7 +387,7 @@ impl RecordingEffectsState {
         Self {
             config,
             target: None,
-            init_script_identifier: None,
+            init_scripts: Vec::new(),
             overlay_chain_until: None,
             effect_active_until: None,
             runtime_installed: false,
@@ -422,10 +428,14 @@ impl RecordingEffectsState {
                 }
             } else {
                 let identifier = runtime.install_for_new_documents().await?;
-                self.init_script_identifier = Some(identifier.clone());
+                self.init_scripts.push(RecordingEffectsInitScript {
+                    target: runtime.target.clone(),
+                    identifier: identifier.clone(),
+                });
                 if let Err(err) = runtime.install().await {
                     let _ = runtime.remove_new_document_script(&identifier).await;
-                    self.init_script_identifier = None;
+                    self.init_scripts
+                        .retain(|script| script.identifier != identifier);
                     return Err(err);
                 }
                 self.runtime_installed = true;
@@ -441,16 +451,38 @@ impl RecordingEffectsState {
         self.install().await
     }
 
+    pub async fn retarget(
+        &mut self,
+        client: Arc<CdpClient>,
+        session_id: String,
+    ) -> Result<(), String> {
+        let unchanged = self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.session_id == session_id);
+        self.target = Some(RecordingEffectsTarget { client, session_id });
+        if !unchanged {
+            self.runtime_installed = false;
+        }
+        self.install().await
+    }
+
     pub async fn cleanup(&mut self) -> Result<(), String> {
         let Some(runtime) = self.runtime() else {
             return Ok(());
         };
         let mut error = runtime.cleanup().await.err();
-        if let Some(identifier) = self.init_script_identifier.clone() {
-            match runtime.remove_new_document_script(&identifier).await {
-                Ok(()) => {
-                    self.init_script_identifier = None;
-                }
+        for script in std::mem::take(&mut self.init_scripts) {
+            let script_runtime = RecordingEffectsRuntime {
+                target: script.target,
+                config: self.config.clone(),
+                cursor_point: self.cursor_point,
+            };
+            match script_runtime
+                .remove_new_document_script(&script.identifier)
+                .await
+            {
+                Ok(()) => {}
                 Err(err) => {
                     if error.is_none() {
                         error = Some(err);
@@ -958,6 +990,10 @@ impl RecordingEffectsHandle {
 
     pub async fn refresh_current_document(&self) -> Result<(), String> {
         self.shared.lock().await.refresh_current_document().await
+    }
+
+    pub async fn retarget(&self, client: Arc<CdpClient>, session_id: String) -> Result<(), String> {
+        self.shared.lock().await.retarget(client, session_id).await
     }
 }
 
