@@ -371,6 +371,7 @@ pub struct RecordingEffectsState {
     overlay_chain_until: Option<Instant>,
     effect_active_until: Option<Instant>,
     runtime_installed: bool,
+    cursor_point: Option<(f64, f64)>,
     pending_move: Option<(f64, f64)>,
     move_flush_scheduled: bool,
 }
@@ -384,6 +385,7 @@ impl RecordingEffectsState {
             overlay_chain_until: None,
             effect_active_until: None,
             runtime_installed: false,
+            cursor_point: None,
             pending_move: None,
             move_flush_scheduled: false,
         }
@@ -411,7 +413,13 @@ impl RecordingEffectsState {
     pub async fn install(&mut self) -> Result<(), String> {
         if let Some(runtime) = self.runtime() {
             if self.runtime_installed {
-                runtime.configure().await?;
+                match runtime.configure().await {
+                    Ok(()) => {}
+                    Err(err) if is_missing_runtime_error(&err) => {
+                        runtime.install().await?;
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 let identifier = runtime.install_for_new_documents().await?;
                 self.init_script_identifier = Some(identifier.clone());
@@ -424,6 +432,13 @@ impl RecordingEffectsState {
             }
         }
         Ok(())
+    }
+
+    pub async fn refresh_current_document(&mut self) -> Result<(), String> {
+        if self.target.is_none() {
+            return Ok(());
+        }
+        self.install().await
     }
 
     pub async fn cleanup(&mut self) -> Result<(), String> {
@@ -454,13 +469,15 @@ impl RecordingEffectsState {
         self.target.as_ref().map(|target| RecordingEffectsRuntime {
             target: target.clone(),
             config: self.config.clone(),
+            cursor_point: self.cursor_point,
         })
     }
 
-    pub fn move_to(&mut self, _x: f64, _y: f64) {
+    pub fn move_to(&mut self, x: f64, y: f64) {
         let Some(cursor) = self.config.cursor.clone() else {
             return;
         };
+        self.cursor_point = Some((x, y));
         let now = Instant::now();
         self.extend_effect_active_until(
             now + Duration::from_millis(cursor.effective_tween_ms() as u64),
@@ -567,11 +584,12 @@ impl RecordingEffectsState {
 struct RecordingEffectsRuntime {
     target: RecordingEffectsTarget,
     config: RecordingEffectsConfig,
+    cursor_point: Option<(f64, f64)>,
 }
 
 impl RecordingEffectsRuntime {
     fn config_json(&self) -> Value {
-        recording_effects_config_json(&self.config)
+        recording_effects_config_json(&self.config, self.cursor_point)
     }
 
     fn install_source(&self) -> String {
@@ -754,11 +772,14 @@ impl RecordingEffectsRuntime {
     }
 }
 
-fn recording_effects_config_json(config: &RecordingEffectsConfig) -> Value {
+fn recording_effects_config_json(
+    config: &RecordingEffectsConfig,
+    cursor_point: Option<(f64, f64)>,
+) -> Value {
     let Some(cursor) = config.cursor.as_ref() else {
         return json!({ "cursor": null });
     };
-    json!({
+    let mut value = json!({
         "cursor": {
             "theme": cursor.theme.as_str(),
             "size": cursor.size_px,
@@ -767,14 +788,18 @@ fn recording_effects_config_json(config: &RecordingEffectsConfig) -> Value {
             "motion": cursor.motion.as_str(),
             "clickSync": cursor.click_sync.as_str(),
         }
-    })
+    });
+    if let Some((x, y)) = cursor_point.filter(|(x, y)| x.is_finite() && y.is_finite()) {
+        value["cursorPoint"] = json!({ "x": x, "y": y });
+    }
+    value
 }
 
 fn recording_effects_install_source(config: &RecordingEffectsConfig) -> String {
     format!(
         "{}\nwindow.__agentBrowserRecordingEffects.configure({});",
         RECORDING_EFFECTS_RUNTIME_JS,
-        recording_effects_config_json(config)
+        recording_effects_config_json(config, None)
     )
 }
 
@@ -930,6 +955,10 @@ impl RecordingEffectsHandle {
     pub async fn cleanup(&self) -> Result<(), String> {
         self.shared.lock().await.cleanup().await
     }
+
+    pub async fn refresh_current_document(&self) -> Result<(), String> {
+        self.shared.lock().await.refresh_current_document().await
+    }
 }
 
 fn js_string(value: &str) -> String {
@@ -953,12 +982,13 @@ fn runtime_async_call(call: String) -> String {
 
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
-  const VERSION = 6;
+  const VERSION = 7;
   if (window.top !== window) return;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
   const Z = '2147483647';
   const ns = 'http://www.w3.org/2000/svg';
+  const cursorStorageKey = '__agentBrowserRecordingCursorPoint';
   const defaultConfig = {
     cursor: {
       theme: 'arrow',
@@ -982,6 +1012,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let zoomResetTimer = null;
   let zoomGeneration = 0;
   let zoomOriginalStyles = null;
+  let zoomLayer = null;
   let installedStyle = null;
 
   function ensureRoot() {
@@ -1008,6 +1039,30 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     root.setAttribute('data-agent-browser-recording-root', '');
     document.documentElement.appendChild(root);
     return root;
+  }
+
+  function finitePoint(point) {
+    if (!point) return null;
+    const x = Number(point.x);
+    const y = Number(point.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return { x, y };
+  }
+
+  function readStoredCursorPoint() {
+    try {
+      return finitePoint(JSON.parse(sessionStorage.getItem(cursorStorageKey) || 'null'));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeStoredCursorPoint(point) {
+    const next = finitePoint(point);
+    if (!next) return;
+    try {
+      sessionStorage.setItem(cursorStorageKey, JSON.stringify(next));
+    } catch (_) {}
   }
 
   function cursorShape(theme) {
@@ -1109,11 +1164,12 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     const el = ensureCursor();
     if (!el) return;
     updateCursorShape();
-    const point = cursorPoint || idleCursorPoint();
+    const point = cursorPoint || finitePoint(config.cursorPoint) || readStoredCursorPoint() || idleCursorPoint();
     cursorPoint = point;
     cursorVisible = true;
     el.style.opacity = '1';
     el.style.transform = cursorTransform(point);
+    writeStoredCursorPoint(point);
   }
 
   function initialCursorPoint(to) {
@@ -1142,6 +1198,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       el.style.opacity = '1';
       el.style.transform = cursorTransform(to);
       cursorPoint = to;
+      writeStoredCursorPoint(to);
       return;
     }
     el.style.opacity = '1';
@@ -1161,6 +1218,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     el.style.opacity = '1';
     el.style.transform = cursorTransform(to);
     cursorPoint = to;
+    writeStoredCursorPoint(to);
   }
 
   function burst(x, y, duration) {
@@ -1393,16 +1451,59 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     return new Promise(resolve => requestAnimationFrame(resolve));
   }
 
+  function visibleBackgroundColor() {
+    const bodyBg = getComputedStyle(document.body || document.documentElement).backgroundColor;
+    if (bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' && bodyBg !== 'transparent') return bodyBg;
+    const htmlBg = getComputedStyle(document.documentElement).backgroundColor;
+    if (htmlBg && htmlBg !== 'rgba(0, 0, 0, 0)' && htmlBg !== 'transparent') return htmlBg;
+    return '';
+  }
+
+  function ensureZoomLayer() {
+    const body = document.body;
+    if (!body) return null;
+    if (zoomLayer && zoomLayer.isConnected) return zoomLayer;
+    zoomLayer = document.createElement('div');
+    zoomLayer.setAttribute('data-agent-browser-recording-zoom-layer', '');
+    while (body.firstChild) {
+      zoomLayer.appendChild(body.firstChild);
+    }
+    body.appendChild(zoomLayer);
+    Object.assign(zoomLayer.style, {
+      minHeight: '100vh',
+      width: '100%',
+      transformOrigin: '0 0',
+      transform: 'none',
+      transition: 'none',
+      willChange: 'transform',
+    });
+    return zoomLayer;
+  }
+
+  function unwrapZoomLayer() {
+    const body = document.body;
+    if (!body || !zoomLayer || !zoomLayer.isConnected) return;
+    while (zoomLayer.firstChild) {
+      body.insertBefore(zoomLayer.firstChild, zoomLayer);
+    }
+    zoomLayer.remove();
+    zoomLayer = null;
+  }
+
   function snapshotZoomStyles() {
     if (zoomOriginalStyles) return;
     const body = document.body;
     if (!body) return;
+    const background = visibleBackgroundColor();
     zoomOriginalStyles = {
       htmlOverflow: document.documentElement.style.overflow,
+      htmlBackground: document.documentElement.style.background,
       bodyOverflow: body.style.overflow,
-      bodyTransformOrigin: body.style.transformOrigin,
-      bodyTransition: body.style.transition,
-      bodyTransform: body.style.transform,
+      bodyBackground: body.style.background,
+      layerTransformOrigin: zoomLayer?.style.transformOrigin || '',
+      layerTransition: zoomLayer?.style.transition || '',
+      layerTransform: zoomLayer?.style.transform || '',
+      background,
     };
   }
 
@@ -1410,11 +1511,16 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     const body = document.body;
     if (!body || !zoomOriginalStyles) return;
     document.documentElement.style.overflow = zoomOriginalStyles.htmlOverflow;
+    document.documentElement.style.background = zoomOriginalStyles.htmlBackground;
     body.style.overflow = zoomOriginalStyles.bodyOverflow;
-    body.style.transformOrigin = zoomOriginalStyles.bodyTransformOrigin;
-    body.style.transition = zoomOriginalStyles.bodyTransition;
-    body.style.transform = zoomOriginalStyles.bodyTransform;
+    body.style.background = zoomOriginalStyles.bodyBackground;
+    if (zoomLayer) {
+      zoomLayer.style.transformOrigin = zoomOriginalStyles.layerTransformOrigin;
+      zoomLayer.style.transition = zoomOriginalStyles.layerTransition;
+      zoomLayer.style.transform = zoomOriginalStyles.layerTransform;
+    }
     zoomOriginalStyles = null;
+    unwrapZoomLayer();
   }
 
   async function zoomTo(x, y, scale, durationMs = null) {
@@ -1423,7 +1529,8 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     zoomGeneration += 1;
     const generation = zoomGeneration;
     const body = document.body;
-    if (!body) return;
+    const layer = ensureZoomLayer();
+    if (!body || !layer) return;
     snapshotZoomStyles();
     const vw = window.innerWidth || document.documentElement.clientWidth || 1;
     const vh = window.innerHeight || document.documentElement.clientHeight || 1;
@@ -1439,13 +1546,18 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     }
     document.documentElement.style.overflow = 'hidden';
     body.style.overflow = 'hidden';
-    body.style.transformOrigin = `${originX}px ${originY}px`;
-    body.style.transition = 'none';
-    void body.getBoundingClientRect();
+    if (zoomOriginalStyles?.background) {
+      document.documentElement.style.background = zoomOriginalStyles.background;
+      body.style.background = zoomOriginalStyles.background;
+    }
+    layer.style.transformOrigin = `${originX}px ${originY}px`;
+    layer.style.transition = 'none';
+    if (!layer.style.transform || layer.style.transform === 'none') layer.style.transform = 'scale(1)';
+    void layer.getBoundingClientRect();
     await nextAnimationFrame();
     if (generation !== zoomGeneration) return;
-    body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
-    body.style.transform = `scale(${s})`;
+    layer.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
+    layer.style.transform = `scale(${s})`;
     if (durationMs !== null && durationMs !== undefined) {
       zoomResetTimer = setTimeout(() => zoomReset(generation), Math.max(1, Number(durationMs) || 1));
     }
@@ -1453,20 +1565,20 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 
   async function zoomReset(expectedGeneration = null) {
     clearTimeout(zoomResetTimer);
-    const body = document.body;
-    if (!body) return;
+    const layer = zoomLayer;
+    if (!layer) return;
     const generation = expectedGeneration ?? ++zoomGeneration;
     if (expectedGeneration === null) zoomGeneration = generation;
-    const computedTransform = getComputedStyle(body).transform;
+    const computedTransform = getComputedStyle(layer).transform;
     if (computedTransform && computedTransform !== 'none') {
-      body.style.transition = 'none';
-      body.style.transform = computedTransform;
-      void body.getBoundingClientRect();
+      layer.style.transition = 'none';
+      layer.style.transform = computedTransform;
+      void layer.getBoundingClientRect();
       await nextAnimationFrame();
       if (generation !== zoomGeneration) return;
     }
-    body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
-    body.style.transform = zoomOriginalStyles?.bodyTransform || '';
+    layer.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
+    layer.style.transform = zoomOriginalStyles?.layerTransform || 'scale(1)';
     await new Promise(resolve => setTimeout(resolve, 700));
     if (generation !== zoomGeneration) return;
     restoreZoomStyles();
@@ -1495,6 +1607,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       config = { ...defaultConfig, ...nextConfig };
       if (nextConfig.cursor === null) config.cursor = null;
       else config.cursor = { ...defaultConfig.cursor, ...(nextConfig.cursor || {}) };
+      config.cursorPoint = finitePoint(nextConfig.cursorPoint) || readStoredCursorPoint();
       updateCursorShape();
       ensureVisibleCursor();
     },
@@ -1672,6 +1785,25 @@ mod tests {
     }
 
     #[test]
+    fn cursor_position_is_carried_into_runtime_config() {
+        let cfg = RecordingEffectsConfig::from_cmd(
+            RecordEffectsPreset::Demo,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let mut state = RecordingEffectsState::new(cfg);
+        state.move_to(320.0, 180.0);
+        let config = recording_effects_config_json(&state.config, state.cursor_point);
+
+        assert_eq!(config["cursorPoint"], json!({ "x": 320.0, "y": 180.0 }));
+    }
+
+    #[test]
     fn runtime_script_defines_dom_only_effects() {
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("__agentBrowserRecordingEffects"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-root"));
@@ -1681,6 +1813,8 @@ mod tests {
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("overlayChain"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-click"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-spotlight"));
+        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-zoom-layer"));
+        assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("body.style.transform = `scale"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("composite_frame"));
     }
 
