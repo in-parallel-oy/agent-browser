@@ -1559,7 +1559,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === Recording (browser video recording) ===
         "record" => {
-            const VALID: &[&str] = &["start", "stop", "restart", "overlay", "zoom"];
+            const VALID: &[&str] = &["start", "stop", "abort", "restart", "overlay", "zoom"];
             match rest.first().copied() {
                 Some("start") => {
                     let parsed = split_record_args(&rest[1..], "record start")?;
@@ -1599,6 +1599,10 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     Ok(cmd)
                 }
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
+                Some("abort") => {
+                    reject_trailing_record_args(&rest[1..], "record abort")?;
+                    Ok(json!({ "id": id, "action": "recording_abort" }))
+                }
                 Some("restart") => {
                     let parsed = split_record_args(&rest[1..], "record restart")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
@@ -4979,6 +4983,18 @@ mod tests {
     fn test_record_stop() {
         let cmd = parse_command(&args("record stop"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "recording_stop");
+    }
+
+    #[test]
+    fn test_record_abort() {
+        let cmd = parse_command(&args("record abort"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_abort");
+    }
+
+    #[test]
+    fn test_record_abort_rejects_trailing_args() {
+        let result = parse_command(&args("record abort --force"), &default_flags());
+        assert!(result.is_err());
     }
 
     #[test]

@@ -144,6 +144,21 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
     Ok(json!({ "path": &state.output_path, "frames": state.frame_count }))
 }
 
+pub fn recording_abort(state: &mut RecordingState) -> Result<Value, String> {
+    if !state.active {
+        return Err("No recording in progress".to_string());
+    }
+
+    let path = state.output_path.clone();
+    state.active = false;
+    state.output_path.clear();
+    state.frame_count = 0;
+    state.capture_gate = None;
+    state.capture_session = None;
+
+    Ok(json!({ "aborted": true, "path": path }))
+}
+
 pub fn recording_restart(state: &mut RecordingState, path: &str) -> Result<Value, String> {
     let previous = if state.active {
         let stop_result = recording_stop(state);
@@ -425,6 +440,19 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No frames"));
         assert!(!state.active);
+    }
+
+    #[test]
+    fn test_recording_abort_discards_state_without_frames() {
+        let mut state = RecordingState::new();
+        recording_start(&mut state, "/tmp/test.webm").unwrap();
+        let result = recording_abort(&mut state).unwrap();
+
+        assert_eq!(result["aborted"], true);
+        assert_eq!(result["path"], "/tmp/test.webm");
+        assert!(!state.active);
+        assert_eq!(state.frame_count, 0);
+        assert!(state.output_path.is_empty());
     }
 
     #[test]

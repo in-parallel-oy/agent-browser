@@ -95,6 +95,7 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "profiler_stop",
     "recording_start",
     "recording_stop",
+    "recording_abort",
     "recording_restart",
     "recording_overlay",
     "recording_zoom",

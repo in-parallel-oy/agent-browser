@@ -55,6 +55,7 @@ agent-browser record zoom reset
   <tbody>
     <tr><td><code>record start &lt;path.webm&gt; [url]</code></td><td>Start recording to a WebM file</td></tr>
     <tr><td><code>record stop</code></td><td>Stop the active recording and save the file</td></tr>
+    <tr><td><code>record abort</code></td><td>Stop the active recording and discard the partial output file</td></tr>
     <tr><td><code>record restart &lt;path.webm&gt; [url]</code></td><td>Stop the current recording and immediately start another</td></tr>
     <tr><td><code>record overlay text &lt;text&gt;</code></td><td>Add a serialized subtitle-style text overlay to the recording. <code>--duration-ms</code> controls how long it stays visible before it auto-dismisses and the next command continues.</td></tr>
     <tr><td><code>record overlay spotlight &lt;selector|ref&gt;</code> or <code>--x &lt;n&gt; --y &lt;n&gt;</code></td><td>Highlight an element or viewport coordinate in the recording for the requested duration. Selector targets derive radius from the element box; any target can pass <code>--radius</code> to override it.</td></tr>
@@ -88,7 +89,7 @@ Keep recordings as CI artifacts when browser failures are hard to diagnose from 
 
 ## Human-readable demos
 
-Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition.
+Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition. Use `record abort` instead of `record stop` when a take should be discarded.
 
 ```bash
 agent-browser open https://shop.example.com

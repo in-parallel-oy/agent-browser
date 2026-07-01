@@ -807,6 +807,18 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             }
             return;
         }
+        if data.get("aborted").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
+                println!(
+                    "{} Recording discarded: {}",
+                    color::success_indicator(),
+                    path
+                );
+            } else {
+                println!("{} Recording discarded", color::success_indicator());
+            }
+            return;
+        }
         // Recording stop (has "frames" field - from recording_stop action)
         if data.get("frames").is_some() {
             if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
@@ -2417,6 +2429,7 @@ agent-browser record - Record browser session to video
 
 Usage: agent-browser record start <path.webm> [url] [effect flags]
        agent-browser record stop
+       agent-browser record abort
        agent-browser record restart <path.webm> [url] [effect flags]
        agent-browser record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]
        agent-browser record overlay spotlight <selector|ref>|--x <n> --y <n> [--radius <n>] [--duration-ms <n>]
@@ -2432,6 +2445,7 @@ recording starts.
 Operations:
   start <path> [url]     Start recording (defaults to current URL if omitted)
   stop                   Stop recording and save video
+  abort                  Stop recording and discard the partial video
   restart <path> [url]   Stop current recording (if any) and start a new one
 
 Recording Effects:

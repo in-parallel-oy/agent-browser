@@ -1664,6 +1664,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "profiler_stop" => handle_profiler_stop(cmd, state).await,
         "recording_start" => handle_recording_start(cmd, state).await,
         "recording_stop" => handle_recording_stop(state).await,
+        "recording_abort" => handle_recording_abort(state).await,
         "recording_restart" => handle_recording_restart(cmd, state).await,
         "recording_overlay" => handle_recording_overlay(cmd, state).await,
         "recording_zoom" => handle_recording_zoom(cmd, state).await,
@@ -4892,6 +4893,38 @@ async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String>
     task_result?;
     clear_result?;
     result
+}
+
+async fn handle_recording_abort(state: &mut DaemonState) -> Result<Value, String> {
+    let output_path = state.recording_state.output_path.clone();
+    let task_result = state.stop_recording_task().await;
+    let result = recording::recording_abort(&mut state.recording_state);
+    let clear_result = clear_recording_effects(state).await;
+
+    if let Some(ref server) = state.stream_server {
+        server.set_recording(false, &state.engine).await;
+    }
+
+    let mut response = result?;
+    let delete_result = if output_path.is_empty() {
+        Ok(())
+    } else {
+        match std::fs::remove_file(&output_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("Failed to delete partial recording: {}", err)),
+        }
+    };
+
+    if let Err(err) = task_result {
+        response["warning"] = json!(format!(
+            "Recording task ended with an error while aborting: {}",
+            err
+        ));
+    }
+    clear_result?;
+    delete_result?;
+    Ok(response)
 }
 
 async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

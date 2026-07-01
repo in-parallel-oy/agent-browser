@@ -1018,7 +1018,7 @@ fn runtime_async_call(call: String) -> String {
 
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
-  const VERSION = 7;
+  const VERSION = 8;
   if (window.top !== window) return;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
@@ -1048,7 +1048,6 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let zoomResetTimer = null;
   let zoomGeneration = 0;
   let zoomOriginalStyles = null;
-  let zoomLayer = null;
   let installedStyle = null;
 
   function ensureRoot() {
@@ -1495,37 +1494,6 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     return '';
   }
 
-  function ensureZoomLayer() {
-    const body = document.body;
-    if (!body) return null;
-    if (zoomLayer && zoomLayer.isConnected) return zoomLayer;
-    zoomLayer = document.createElement('div');
-    zoomLayer.setAttribute('data-agent-browser-recording-zoom-layer', '');
-    while (body.firstChild) {
-      zoomLayer.appendChild(body.firstChild);
-    }
-    body.appendChild(zoomLayer);
-    Object.assign(zoomLayer.style, {
-      minHeight: '100vh',
-      width: '100%',
-      transformOrigin: '0 0',
-      transform: 'none',
-      transition: 'none',
-      willChange: 'transform',
-    });
-    return zoomLayer;
-  }
-
-  function unwrapZoomLayer() {
-    const body = document.body;
-    if (!body || !zoomLayer || !zoomLayer.isConnected) return;
-    while (zoomLayer.firstChild) {
-      body.insertBefore(zoomLayer.firstChild, zoomLayer);
-    }
-    zoomLayer.remove();
-    zoomLayer = null;
-  }
-
   function snapshotZoomStyles() {
     if (zoomOriginalStyles) return;
     const body = document.body;
@@ -1536,9 +1504,10 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       htmlBackground: document.documentElement.style.background,
       bodyOverflow: body.style.overflow,
       bodyBackground: body.style.background,
-      layerTransformOrigin: zoomLayer?.style.transformOrigin || '',
-      layerTransition: zoomLayer?.style.transition || '',
-      layerTransform: zoomLayer?.style.transform || '',
+      bodyTransformOrigin: body.style.transformOrigin,
+      bodyTransition: body.style.transition,
+      bodyTransform: body.style.transform,
+      bodyWillChange: body.style.willChange,
       background,
     };
   }
@@ -1550,13 +1519,16 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     document.documentElement.style.background = zoomOriginalStyles.htmlBackground;
     body.style.overflow = zoomOriginalStyles.bodyOverflow;
     body.style.background = zoomOriginalStyles.bodyBackground;
-    if (zoomLayer) {
-      zoomLayer.style.transformOrigin = zoomOriginalStyles.layerTransformOrigin;
-      zoomLayer.style.transition = zoomOriginalStyles.layerTransition;
-      zoomLayer.style.transform = zoomOriginalStyles.layerTransform;
-    }
+    body.style.transformOrigin = zoomOriginalStyles.bodyTransformOrigin;
+    body.style.transition = zoomOriginalStyles.bodyTransition;
+    body.style.transform = zoomOriginalStyles.bodyTransform;
+    body.style.willChange = zoomOriginalStyles.bodyWillChange;
     zoomOriginalStyles = null;
-    unwrapZoomLayer();
+  }
+
+  function zoomBodyTransform(scale) {
+    const base = zoomOriginalStyles?.bodyTransform || '';
+    return base && base !== 'none' ? `${base} scale(${scale})` : `scale(${scale})`;
   }
 
   async function zoomTo(x, y, scale, durationMs = null) {
@@ -1565,8 +1537,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     zoomGeneration += 1;
     const generation = zoomGeneration;
     const body = document.body;
-    const layer = ensureZoomLayer();
-    if (!body || !layer) return;
+    if (!body) return;
     snapshotZoomStyles();
     const vw = window.innerWidth || document.documentElement.clientWidth || 1;
     const vh = window.innerHeight || document.documentElement.clientHeight || 1;
@@ -1586,14 +1557,15 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       document.documentElement.style.background = zoomOriginalStyles.background;
       body.style.background = zoomOriginalStyles.background;
     }
-    layer.style.transformOrigin = `${originX}px ${originY}px`;
-    layer.style.transition = 'none';
-    if (!layer.style.transform || layer.style.transform === 'none') layer.style.transform = 'scale(1)';
-    void layer.getBoundingClientRect();
+    body.style.transformOrigin = `${originX}px ${originY}px`;
+    body.style.transition = 'none';
+    body.style.willChange = 'transform';
+    body.style.transform = zoomBodyTransform(1);
+    void body.getBoundingClientRect();
     await nextAnimationFrame();
     if (generation !== zoomGeneration) return;
-    layer.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
-    layer.style.transform = `scale(${s})`;
+    body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
+    body.style.transform = zoomBodyTransform(s);
     if (durationMs !== null && durationMs !== undefined) {
       zoomResetTimer = setTimeout(() => zoomReset(generation), Math.max(1, Number(durationMs) || 1));
     }
@@ -1601,20 +1573,20 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 
   async function zoomReset(expectedGeneration = null) {
     clearTimeout(zoomResetTimer);
-    const layer = zoomLayer;
-    if (!layer) return;
+    const body = document.body;
+    if (!body) return;
     const generation = expectedGeneration ?? ++zoomGeneration;
     if (expectedGeneration === null) zoomGeneration = generation;
-    const computedTransform = getComputedStyle(layer).transform;
+    const computedTransform = getComputedStyle(body).transform;
     if (computedTransform && computedTransform !== 'none') {
-      layer.style.transition = 'none';
-      layer.style.transform = computedTransform;
-      void layer.getBoundingClientRect();
+      body.style.transition = 'none';
+      body.style.transform = computedTransform;
+      void body.getBoundingClientRect();
       await nextAnimationFrame();
       if (generation !== zoomGeneration) return;
     }
-    layer.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
-    layer.style.transform = zoomOriginalStyles?.layerTransform || 'scale(1)';
+    body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
+    body.style.transform = zoomOriginalStyles?.bodyTransform || 'scale(1)';
     await new Promise(resolve => setTimeout(resolve, 700));
     if (generation !== zoomGeneration) return;
     restoreZoomStyles();
@@ -1849,8 +1821,9 @@ mod tests {
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("overlayChain"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-click"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-spotlight"));
-        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-zoom-layer"));
+        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("body.style.transformOrigin"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("body.style.transform = `scale"));
+        assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("while (body.firstChild)"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("composite_frame"));
     }
 

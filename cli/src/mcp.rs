@@ -105,6 +105,7 @@ const TOOL_PROFILER_START: &str = "agent_browser_profiler_start";
 const TOOL_PROFILER_STOP: &str = "agent_browser_profiler_stop";
 const TOOL_RECORD_START: &str = "agent_browser_record_start";
 const TOOL_RECORD_STOP: &str = "agent_browser_record_stop";
+const TOOL_RECORD_ABORT: &str = "agent_browser_record_abort";
 const TOOL_RECORD_RESTART: &str = "agent_browser_record_restart";
 const TOOL_RECORD_OVERLAY: &str = "agent_browser_record_overlay";
 const TOOL_RECORD_ZOOM: &str = "agent_browser_record_zoom";
@@ -403,6 +404,7 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_PROFILER_STOP,
     TOOL_RECORD_START,
     TOOL_RECORD_STOP,
+    TOOL_RECORD_ABORT,
     TOOL_RECORD_RESTART,
     TOOL_CONSOLE,
     TOOL_ERRORS,
@@ -1298,6 +1300,13 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            TOOL_RECORD_ABORT,
+            "Record abort",
+            "Abort video recording and discard the partial output file. Use this when a scripted demo goes wrong and should not be saved.",
+            json!({}),
+            &[],
+        ),
+        tool(
             TOOL_RECORD_RESTART,
             "Record restart",
             "Restart video recording of the current live page.",
@@ -2123,6 +2132,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_PROFILER_STOP => call_optional_one(arguments, &["profiler", "stop"], "path"),
         TOOL_RECORD_START => call_record_start(arguments, "start"),
         TOOL_RECORD_STOP => call_literal(arguments, &["record", "stop"]),
+        TOOL_RECORD_ABORT => call_literal(arguments, &["record", "abort"]),
         TOOL_RECORD_RESTART => call_record_start(arguments, "restart"),
         TOOL_RECORD_OVERLAY => call_record_overlay(arguments),
         TOOL_RECORD_ZOOM => call_record_zoom(arguments),
@@ -4136,10 +4146,18 @@ mod tests {
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_RECORD_START))
             .unwrap();
+        let abort = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_RECORD_ABORT))
+            .unwrap();
         let restart = tools
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_RECORD_RESTART))
             .unwrap();
+        assert!(abort["inputSchema"]["properties"].get("path").is_none());
+        assert!(abort["inputSchema"]["properties"]
+            .get("recordMode")
+            .is_none());
         assert_eq!(
             record["inputSchema"]["properties"]["recordEffects"]["enum"],
             json!(["cursor", "demo", "off"])
