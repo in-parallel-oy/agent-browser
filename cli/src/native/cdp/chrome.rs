@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
@@ -390,33 +391,25 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
     })?;
 
-    // Shared overall deadline so we don't double-wait (poll + stderr fallback).
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let stderr = child.stderr.take().ok_or_else(|| {
+        let _ = child.kill();
+        cleanup_temp_dir(&temp_user_data_dir);
+        "Failed to capture Chrome stderr".to_string()
+    })?;
+    let stderr_rx = spawn_stderr_reader(stderr);
 
-    // Primary path: use DevToolsActivePort written into user-data-dir.
-    // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
-    // which can be missing/empty depending on how Chrome is launched.
-    let ws_url = match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
+    // One overall deadline covers both the active-port file and stderr. Stderr
+    // is drained on a separate thread so a silent, still-running executable
+    // cannot block the deadline check.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let ws_url = match wait_for_devtools_endpoint(&mut child, &user_data_dir, &stderr_rx, deadline)
+    {
         Ok(url) => url,
-        Err(primary_err) => {
-            // Fallback: scrape stderr (legacy behavior) for better diagnostics.
-            let stderr = child.stderr.take().ok_or_else(|| {
-                let _ = child.kill();
-                cleanup_temp_dir(&temp_user_data_dir);
-                "Failed to capture Chrome stderr".to_string()
-            })?;
-            let reader = BufReader::new(stderr);
-            match wait_for_ws_url_until(reader, deadline) {
-                Ok(url) => url,
-                Err(fallback_err) => {
-                    let _ = child.kill();
-                    cleanup_temp_dir(&temp_user_data_dir);
-                    return Err(format!(
-                        "{}\n(also tried parsing stderr) {}",
-                        primary_err, fallback_err
-                    ));
-                }
-            }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
         }
     };
 
@@ -437,61 +430,77 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     })
 }
 
-fn wait_for_devtools_active_port(
+enum StderrEvent {
+    Line(String),
+    ReadError(String),
+    Closed,
+}
+
+fn spawn_stderr_reader(stderr: std::process::ChildStderr) -> Receiver<StderrEvent> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let event = match line {
+                Ok(line) => StderrEvent::Line(line),
+                Err(error) => StderrEvent::ReadError(error.to_string()),
+            };
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+        let _ = sender.send(StderrEvent::Closed);
+    });
+    receiver
+}
+
+fn wait_for_devtools_endpoint(
     child: &mut Child,
     user_data_dir: &Path,
+    stderr_rx: &Receiver<StderrEvent>,
     deadline: std::time::Instant,
 ) -> Result<String, String> {
+    let stderr_prefix = "DevTools listening on ";
+    let mut stderr_lines = Vec::new();
     let poll_interval = Duration::from_millis(50);
 
     while std::time::Instant::now() <= deadline {
+        while let Ok(event) = stderr_rx.try_recv() {
+            match event {
+                StderrEvent::Line(line) => {
+                    if let Some(url) = line.strip_prefix(stderr_prefix) {
+                        return Ok(url.trim().to_string());
+                    }
+                    stderr_lines.push(line);
+                }
+                StderrEvent::ReadError(error) => {
+                    return Err(format!("Failed to read Chrome stderr: {error}"));
+                }
+                StderrEvent::Closed => {}
+            }
+        }
+
+        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
+            return Ok(format!("ws://127.0.0.1:{port}{ws_path}"));
+        }
+
         if let Ok(Some(status)) = child.try_wait() {
-            // Chrome exited before writing DevToolsActivePort -- report the
+            // Chrome exited before publishing an endpoint. Report the
             // exit code so the caller can surface it alongside stderr output.
             let code = status
                 .code()
                 .map(|c| format!("{}", c))
                 .unwrap_or_else(|| "unknown".to_string());
-            return Err(format!(
-                "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
-                code
+            return Err(chrome_launch_error(
+                &format!("Chrome exited early (exit code: {code}) without a DevTools endpoint"),
+                &stderr_lines,
             ));
-        }
-
-        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
-            let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
-            return Ok(ws_url);
         }
 
         std::thread::sleep(poll_interval);
     }
 
-    Err("Timeout waiting for DevToolsActivePort".to_string())
-}
-
-fn wait_for_ws_url_until(
-    reader: BufReader<std::process::ChildStderr>,
-    deadline: std::time::Instant,
-) -> Result<String, String> {
-    let prefix = "DevTools listening on ";
-    let mut stderr_lines: Vec<String> = Vec::new();
-
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
-            return Err(chrome_launch_error(
-                "Timeout waiting for Chrome DevTools URL",
-                &stderr_lines,
-            ));
-        }
-        let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
-        if let Some(url) = line.strip_prefix(prefix) {
-            return Ok(url.trim().to_string());
-        }
-        stderr_lines.push(line);
-    }
-
     Err(chrome_launch_error(
-        "Chrome exited before providing DevTools URL",
+        "Timeout waiting for Chrome DevTools endpoint",
         &stderr_lines,
     ))
 }
@@ -1335,6 +1344,33 @@ mod tests {
         let lines = vec!["info line".to_string(), "another info line".to_string()];
         let msg = chrome_launch_error("Chrome exited", &lines);
         assert!(msg.contains("last 2 lines"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_executable_respects_devtools_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let receiver = spawn_stderr_reader(stderr);
+        let started = std::time::Instant::now();
+
+        let error = wait_for_devtools_endpoint(
+            &mut child,
+            temp.path(),
+            &receiver,
+            started + Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(error.contains("Timeout waiting for Chrome DevTools endpoint"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

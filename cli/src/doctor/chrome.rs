@@ -3,6 +3,8 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::helpers::which_exists;
 use super::{Check, Status};
@@ -115,10 +117,30 @@ pub(super) fn check(checks: &mut Vec<Check>) {
 }
 
 fn query_chrome_version(path: &Path) -> Option<String> {
-    let output = std::process::Command::new(path)
+    query_chrome_version_with_timeout(path, Duration::from_secs(2))
+}
+
+fn query_chrome_version_with_timeout(path: &Path, timeout: Duration) -> Option<String> {
+    let mut child = Command::new(path)
         .arg("--version")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let output = child.wait_with_output().ok()?;
+    debug_assert_eq!(output.status, status);
     if !output.status.success() {
         return None;
     }
@@ -152,5 +174,25 @@ mod tests {
             assert!(s.contains(".cache"));
             assert!(s.ends_with("puppeteer"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chrome_version_probe_terminates_silent_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("silent-chrome");
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let started = Instant::now();
+
+        assert_eq!(
+            query_chrome_version_with_timeout(&executable, Duration::from_millis(100)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
