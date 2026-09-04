@@ -24,7 +24,7 @@ If no URL is provided, recording starts from the current page. Recording uses a 
 
 ## Recording effects
 
-The default `cursor` preset renders a synthetic cursor into the video because Chromium screencast frames do not include the OS cursor. Effects are injected into the recorded page and registered for future documents while recording is active, so they come back after navigation. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing with the cursor visible between actions, animated input, blocking visual clicks, and automatic pauses between actions so agent inference delays do not create idle video. Add zoom and overlay emphasis explicitly.
+The default `cursor` preset renders a synthetic cursor into the video because Chromium screencast frames do not include the OS cursor. Effects are injected into the recorded page and registered for future documents while recording is active, so they come back after navigation. Clicks show cursor flight plus click ripple only. Use `--record-mode demo` for slower presentation cursor timing with the cursor visible between actions, target-aware animated input, clicks that remain ordered with their resulting browser paint, and automatic pauses between complete visual actions so agent inference delays do not create idle video. Add zoom and overlay emphasis explicitly.
 
 The default `--cursor-motion auto` renders the cursor while effects are active. Demo mode uses `always` unless you pass an explicit cursor motion flag.
 
@@ -118,7 +118,7 @@ Keep recordings as CI artifacts when browser failures are hard to diagnose from 
 
 ## Human-readable demos
 
-Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition. Use `record abort` instead of `record stop` when a take should be discarded.
+Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. A visual action keeps capture open until the command and its browser-side settling fence complete. This keeps smooth scrolls and click-triggered layout changes next to the click that caused them. Fill and type move the visible recording cursor to their target before input begins. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition. Use `record abort` instead of `record stop` when a take should be discarded.
 
 ```bash
 agent-browser open https://shop.example.com

@@ -882,6 +882,21 @@ impl RecordingEffectsHandle {
         }
     }
 
+    /// Move the synthetic cursor and wait for the browser-rendered tween. Use
+    /// this before a target-based action whose native implementation focuses
+    /// the element without dispatching a mouse event, such as animated input.
+    pub async fn move_to_and_wait(&self, x: f64, y: f64) {
+        let runtime = {
+            let mut guard = self.shared.lock().await;
+            guard.move_to(x, y);
+            guard.pending_move = None;
+            guard.runtime()
+        };
+        if let Some(runtime) = runtime {
+            let _ = runtime.move_to(x, y).await;
+        }
+    }
+
     pub async fn click(&self, x: f64, y: f64) -> Duration {
         let (delay, runtime) = {
             let mut guard = self.shared.lock().await;

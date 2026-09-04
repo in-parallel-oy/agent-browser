@@ -2812,7 +2812,7 @@ Recording Effects:
   --record-effects <preset>   cursor (default), demo, or off; legacy preset alias
   --record-mode <mode>        automation (default) or demo
                               demo keeps cursor visible, slows timing, blocks clicks,
-                              animates fill/type, and skips idle time between actions
+                              settles click results, targets fill/type, and skips idle time
 
 Cursor (rendered by the browser into captured video frames):
   --no-cursor                Disable all synthetic effects

@@ -2726,7 +2726,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    activate_demo_recording_for_action(action, cmd, state).await;
+    let demo_action_started = begin_demo_recording_action(action, state).await;
 
     let result = match action {
         "launch" => handle_launch(cmd, state).await,
@@ -2908,6 +2908,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         validate_restore_if_pending(state).await;
     }
 
+    if demo_action_started {
+        if result.is_ok() {
+            wait_for_demo_recording_visual_settle(action, state).await;
+        }
+        finish_demo_recording_action(state).await;
+    }
+
     // Stamp browser-touching commands so periodic autosave waits for an
     // active command burst to settle before collecting state. Stamped even on
     // error: a failed click can still have navigated.
@@ -2955,14 +2962,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         lifecycle_launched,
         lifecycle_relaunched_browser,
     );
-
-    if resp
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        extend_demo_recording_after_action(action, state).await;
-    }
 
     // Re-drain so a dialog opened by THIS command is reflected in the warning
     // below; events are otherwise only drained at the start of a command.
@@ -3161,19 +3160,91 @@ async fn apply_tab_binding_on_attach_or_rollback(state: &mut DaemonState) -> Res
     }
 }
 
-async fn activate_demo_recording_for_action(action: &str, cmd: &Value, state: &DaemonState) {
+async fn begin_demo_recording_action(action: &str, state: &DaemonState) -> bool {
     if state.recording_state.capture_gate.is_none() || !demo_recording_action_is_visual(action) {
-        return;
+        return false;
     }
-    let duration = demo_recording_action_preroll_duration(action, cmd, state).await;
-    state.activate_demo_recording_for(duration).await;
+    if let Some(ref gate) = state.recording_state.capture_gate {
+        gate.begin_action().await;
+    }
+    true
 }
 
-async fn extend_demo_recording_after_action(action: &str, state: &mut DaemonState) {
-    if state.recording_state.capture_gate.is_none() || !demo_recording_action_is_visual(action) {
+async fn finish_demo_recording_action(state: &DaemonState) {
+    let Some(ref gate) = state.recording_state.capture_gate else {
         return;
+    };
+    let mut tail = std::time::Duration::from_millis(DEMO_CAPTURE_DEFAULT_ACTION_MS);
+    if let Some(ref effects) = state.recording_effects {
+        let effect_tail = effects
+            .lock()
+            .await
+            .stop_post_roll_duration(std::time::Instant::now())
+            .min(std::time::Duration::from_millis(DEMO_CAPTURE_MAX_ACTION_MS));
+        tail = tail.max(effect_tail);
     }
-    state.extend_demo_recording_from_effects().await;
+    gate.end_action(tail).await;
+}
+
+/// Wait for the browser-side consequence of a pointer or scroll action before
+/// accepting the next demo command. Capture remains active during this fence,
+/// so smooth scrolling and click-triggered layout changes stay adjacent to the
+/// action that caused them instead of appearing in a later segment.
+async fn wait_for_demo_recording_visual_settle(action: &str, state: &DaemonState) {
+    let Some((minimum_ms, maximum_ms)) = demo_recording_settle_window_ms(action) else {
+        return;
+    };
+    let Some(ref browser) = state.browser else {
+        return;
+    };
+    let Ok(session_id) = browser.active_session_id() else {
+        return;
+    };
+    let expression = format!(
+        r#"(() => new Promise(resolve => {{
+          const started = performance.now();
+          let lastX = window.scrollX;
+          let lastY = window.scrollY;
+          let quietFrames = 0;
+          const tick = now => {{
+            const x = window.scrollX;
+            const y = window.scrollY;
+            const moved = Math.abs(x - lastX) > 0.5 || Math.abs(y - lastY) > 0.5;
+            quietFrames = moved ? 0 : quietFrames + 1;
+            lastX = x;
+            lastY = y;
+            if ((now - started >= {minimum_ms} && quietFrames >= 4) || now - started >= {maximum_ms}) {{
+              resolve(true);
+              return;
+            }}
+            requestAnimationFrame(tick);
+          }};
+          requestAnimationFrame(tick);
+        }}))()"#
+    );
+    let wait = browser.client.send_command(
+        "Runtime.evaluate",
+        Some(json!({
+            "expression": expression,
+            "awaitPromise": true,
+            "returnByValue": true,
+        })),
+        Some(session_id),
+    );
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(maximum_ms.saturating_add(250)),
+        wait,
+    )
+    .await;
+}
+
+fn demo_recording_settle_window_ms(action: &str) -> Option<(u64, u64)> {
+    match action {
+        "click" | "dblclick" | "tap" | "check" | "uncheck" => Some((550, 1_500)),
+        "scroll" | "wheel" | "scrollintoview" | "swipe" => Some((300, 1_250)),
+        "hover" | "select" | "multiselect" => Some((300, 900)),
+        _ => None,
+    }
 }
 
 fn demo_recording_action_is_visual(action: &str) -> bool {
@@ -3220,91 +3291,6 @@ fn demo_recording_action_is_visual(action: &str) -> bool {
             | "recording_overlay"
             | "recording_zoom"
     )
-}
-
-async fn demo_recording_action_preroll_duration(
-    action: &str,
-    cmd: &Value,
-    state: &DaemonState,
-) -> std::time::Duration {
-    let ms = match action {
-        "recording_overlay" => demo_recording_overlay_preroll_ms(cmd),
-        "recording_zoom" => demo_recording_zoom_preroll_ms(cmd),
-        "fill" | "type" | "keyboard" | "input_keyboard" | "inserttext" => {
-            let text_len = cmd
-                .get("text")
-                .or_else(|| cmd.get("value"))
-                .and_then(|v| v.as_str())
-                .map(str::len)
-                .unwrap_or(0) as u64;
-            let input_delay_ms = if let Some(ref effects) = state.recording_effects {
-                let guard = effects.lock().await;
-                let cfg = guard.config();
-                if matches!(cfg.input_mode, InputMode::Animated) {
-                    cfg.input_delay_ms.max(1)
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            if input_delay_ms == 0 {
-                350
-            } else {
-                500_u64.saturating_add(text_len.saturating_mul(input_delay_ms))
-            }
-        }
-        "navigate" | "back" | "forward" | "reload" | "tab_new" | "tab_switch" => 1_500,
-        "scroll" | "wheel" | "scrollintoview" | "swipe" => 1_500,
-        "click" | "dblclick" | "tap" | "hover" | "mousemove" | "mouse" | "input_mouse" => {
-            demo_recording_cursor_preroll_ms(state).await
-        }
-        _ => 350,
-    };
-    std::time::Duration::from_millis(ms.min(DEMO_CAPTURE_MAX_ACTION_MS))
-}
-
-fn demo_recording_overlay_preroll_ms(cmd: &Value) -> u64 {
-    let duration_ms = cmd
-        .get("durationMs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5_000);
-    match cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("text") {
-        "clear" => 350,
-        "spotlight" | "text" => duration_ms.saturating_add(300),
-        _ => 350,
-    }
-}
-
-fn demo_recording_zoom_preroll_ms(cmd: &Value) -> u64 {
-    match cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("to") {
-        "reset" => 900,
-        "to" => cmd
-            .get("durationMs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(650)
-            .saturating_add(900),
-        _ => 350,
-    }
-}
-
-async fn demo_recording_cursor_preroll_ms(state: &DaemonState) -> u64 {
-    let Some(ref effects) = state.recording_effects else {
-        return 350;
-    };
-    let guard = effects.lock().await;
-    let Some(cursor) = guard.config().cursor.as_ref() else {
-        return 350;
-    };
-    let tween_ms = if matches!(cursor.motion, super::recording_effects::MotionMode::Off) {
-        0
-    } else {
-        cursor.tween_ms as u64
-    };
-    tween_ms
-        .saturating_add(cursor.click_ms as u64)
-        .saturating_add(200)
-        .max(350)
 }
 
 // ---------------------------------------------------------------------------
@@ -5679,6 +5665,16 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let session_id = mgr.active_session_id()?.to_string();
     let (effects, input_mode, input_delay_ms) = recording_input_behavior(state).await;
 
+    move_recording_cursor_to_input(
+        effects.as_ref(),
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await;
+
     if matches!(input_mode, InputMode::Animated) {
         interaction::type_text(
             &mgr.client,
@@ -5723,6 +5719,16 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
     let (effects, input_mode, input_delay_ms) = recording_input_behavior(state).await;
     let delay = delay.or(matches!(input_mode, InputMode::Animated).then_some(input_delay_ms));
+
+    move_recording_cursor_to_input(
+        effects.as_ref(),
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await;
 
     interaction::type_text(
         &mgr.client,
@@ -5773,6 +5779,30 @@ async fn recording_input_behavior(
         cfg.input_mode,
         cfg.input_delay_ms,
     )
+}
+
+async fn move_recording_cursor_to_input(
+    effects: Option<&RecordingEffectsHandle>,
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector: &str,
+    iframe_sessions: &HashMap<String, String>,
+) {
+    let Some(effects) = effects else {
+        return;
+    };
+    if let Ok((x, y, _)) = super::element::resolve_element_center(
+        client,
+        session_id,
+        ref_map,
+        selector,
+        iframe_sessions,
+    )
+    .await
+    {
+        effects.move_to_and_wait(x, y).await;
+    }
 }
 
 /// Parse a key chord string like "Control+a" or "Control+Shift+Enter" into
@@ -16368,5 +16398,16 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             RecordMode::Demo
         ));
         assert!(recording_effects_config_from_cmd(&cmd).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_demo_recording_settle_windows_cover_causal_visual_actions() {
+        assert_eq!(demo_recording_settle_window_ms("click"), Some((550, 1_500)));
+        assert_eq!(
+            demo_recording_settle_window_ms("scroll"),
+            Some((300, 1_250))
+        );
+        assert_eq!(demo_recording_settle_window_ms("hover"), Some((300, 900)));
+        assert_eq!(demo_recording_settle_window_ms("type"), None);
     }
 }

@@ -208,13 +208,19 @@ impl RecordingState {
 /// while a visual action or recording effect is active.
 #[derive(Debug)]
 pub struct RecordingCaptureGate {
-    active_until: Mutex<Option<tokio::time::Instant>>,
+    state: Mutex<RecordingCaptureGateState>,
+}
+
+#[derive(Debug, Default)]
+struct RecordingCaptureGateState {
+    active_actions: u32,
+    active_until: Option<tokio::time::Instant>,
 }
 
 impl RecordingCaptureGate {
     pub fn new_paused() -> Self {
         Self {
-            active_until: Mutex::new(None),
+            state: Mutex::new(RecordingCaptureGateState::default()),
         }
     }
 
@@ -223,19 +229,42 @@ impl RecordingCaptureGate {
             return;
         }
         let until = tokio::time::Instant::now() + duration;
-        if let Ok(mut active_until) = self.active_until.lock() {
-            if active_until.is_none_or(|current| until > current) {
-                *active_until = Some(until);
+        if let Ok(mut state) = self.state.lock() {
+            if state.active_until.is_none_or(|current| until > current) {
+                state.active_until = Some(until);
+            }
+        }
+    }
+
+    /// Keep capture open for the complete lifetime of a visual command. This
+    /// avoids estimating an action's duration before browser-side scrolling,
+    /// navigation, or animation has actually completed.
+    pub async fn begin_action(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_actions = state.active_actions.saturating_add(1);
+        }
+    }
+
+    /// Finish one visual command and retain a short tail for its final paint.
+    pub async fn end_action(&self, tail: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_actions = state.active_actions.saturating_sub(1);
+            if !tail.is_zero() {
+                let until = tokio::time::Instant::now() + tail;
+                if state.active_until.is_none_or(|current| until > current) {
+                    state.active_until = Some(until);
+                }
             }
         }
     }
 
     fn is_active(&self) -> bool {
-        self.active_until
-            .lock()
-            .ok()
-            .and_then(|active_until| *active_until)
-            .is_some_and(|until| until > tokio::time::Instant::now())
+        self.state.lock().ok().is_some_and(|state| {
+            state.active_actions > 0
+                || state
+                    .active_until
+                    .is_some_and(|until| until > tokio::time::Instant::now())
+        })
     }
 }
 
@@ -1305,6 +1334,20 @@ mod tests {
         let gate = RecordingCaptureGate::new_paused();
         assert!(!gate.is_active());
         gate.activate_for(Duration::from_millis(1)).await;
+        assert!(gate.is_active());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!gate.is_active());
+    }
+
+    #[tokio::test]
+    async fn test_demo_capture_gate_stays_active_until_action_ends() {
+        let gate = RecordingCaptureGate::new_paused();
+        gate.begin_action().await;
+        assert!(gate.is_active());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(gate.is_active());
+
+        gate.end_action(Duration::from_millis(2)).await;
         assert!(gate.is_active());
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!gate.is_active());
