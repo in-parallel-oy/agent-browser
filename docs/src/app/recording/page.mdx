@@ -118,7 +118,7 @@ Keep recordings as CI artifacts when browser failures are hard to diagnose from 
 
 ## Human-readable demos
 
-Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. A visual action keeps capture open until the command and its browser-side settling fence complete. This keeps smooth scrolls and click-triggered layout changes next to the click that caused them. Fill and type move the visible recording cursor to their target before input begins. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition. Use `record abort` instead of `record stop` when a take should be discarded.
+Use demo mode when the recording is meant to be watched by a person rather than used as a debugging artifact. Demo capture pauses between visual actions, so separate tool calls and bare waits do not create dead air in the final video. A visual action keeps capture open until the command and its browser-side settling fence complete. This keeps smooth scrolls and click-triggered layout changes next to the click that caused them. Fill and type move the visible recording cursor to their target before input begins. The synthetic cursor and click ripple scale with camera zoom while the pointer tip stays anchored to its target. Presentation primitives pace themselves: overlays and spotlights hold for their requested duration, and zoom commands wait for the camera transition. Use `record abort` instead of `record stop` when a take should be discarded.
 
 ```bash
 agent-browser open https://shop.example.com

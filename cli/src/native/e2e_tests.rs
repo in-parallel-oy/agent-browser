@@ -7325,6 +7325,230 @@ async fn e2e_recording_honors_requested_fps() {
     assert_success(&resp);
 }
 
+/// Verify that browser-rendered interaction effects follow camera zoom as a
+/// single visual system. The cursor tip and click center remain anchored to
+/// the same content point, both effects scale with the page, and a short
+/// temporary zoom does not snap the cursor to its destination size.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_effects_follow_camera_zoom() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": "data:text/html,<style>body{margin:0}</style><main>Effects</main><div id=anchor style='position:fixed;left:299px;top:199px;width:2px;height:2px'></div>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "viewport", "width": 800, "height": 600 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let rec_path =
+        std::env::temp_dir().join(format!("ab-e2e-rec-effects-{}.webm", std::process::id()));
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "recording_start",
+            "path": rec_path.to_string_lossy(),
+            "cursor": {
+                "theme": "arrow",
+                "size": 28,
+                "tweenMs": 0,
+                "clickMs": 1500,
+                "motion": "always"
+            }
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "window.__agentBrowserRecordingEffects.moveTo(300, 200, { durationMs: 0 }).then(() => window.__agentBrowserRecordingEffects.click(300, 200)).then(() => true)"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "6",
+            "action": "recording_zoom",
+            "mode": "to",
+            "x": 300,
+            "y": 200,
+            "scale": 1.5
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let measurement_script = r#"
+        (() => {
+          const cursor = document.querySelector('[data-agent-browser-recording-cursor]');
+          const click = document.querySelector('[data-agent-browser-recording-click]');
+          const clickRing = click.firstElementChild;
+          const cursorMatrix = new DOMMatrixReadOnly(getComputedStyle(cursor).transform);
+          const clickMatrix = new DOMMatrixReadOnly(getComputedStyle(click).transform);
+          const clickRingRect = clickRing.getBoundingClientRect();
+          const cursorScale = Math.hypot(cursorMatrix.a, cursorMatrix.b);
+          const clickScale = Math.hypot(clickMatrix.a, clickMatrix.b);
+          return {
+            cursorWidth: cursor.getBoundingClientRect().width,
+            cursorTipX: cursorMatrix.m41 + Number(cursor.dataset.tipX) * cursorScale,
+            cursorTipY: cursorMatrix.m42 + Number(cursor.dataset.tipY) * cursorScale,
+            clickX: clickRingRect.left + clickRingRect.width / 2,
+            clickY: clickRingRect.top + clickRingRect.height / 2,
+            clickScale,
+          };
+        })()
+    "#;
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "evaluate", "script": measurement_script }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let zoomed = &get_data(&resp)["result"];
+    let close_to = |actual: f64, expected: f64| (actual - expected).abs() < 0.75;
+    assert!(close_to(zoomed["cursorWidth"].as_f64().unwrap(), 42.0));
+    assert!(close_to(zoomed["cursorTipX"].as_f64().unwrap(), 400.0));
+    assert!(close_to(zoomed["cursorTipY"].as_f64().unwrap(), 300.0));
+    assert!(close_to(zoomed["clickX"].as_f64().unwrap(), 400.0));
+    assert!(close_to(zoomed["clickY"].as_f64().unwrap(), 300.0));
+    assert!(close_to(zoomed["clickScale"].as_f64().unwrap(), 1.5));
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "recording_zoom", "mode": "reset" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": measurement_script }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let reset = &get_data(&resp)["result"];
+    assert!(close_to(reset["cursorWidth"].as_f64().unwrap(), 28.0));
+    assert!(close_to(reset["cursorTipX"].as_f64().unwrap(), 300.0));
+    assert!(close_to(reset["cursorTipY"].as_f64().unwrap(), 200.0));
+    assert!(close_to(reset["clickX"].as_f64().unwrap(), 300.0));
+    assert!(close_to(reset["clickY"].as_f64().unwrap(), 200.0));
+    assert!(close_to(reset["clickScale"].as_f64().unwrap(), 1.0));
+
+    let continuity_script = r#"
+        (async () => {
+          const cursor = document.querySelector('[data-agent-browser-recording-cursor]');
+          const anchor = document.getElementById('anchor');
+          await window.__agentBrowserRecordingEffects.click(300, 200);
+          const click = [...document.querySelectorAll('[data-agent-browser-recording-click]')].at(-1);
+          const clickRing = click.firstElementChild;
+          const samples = [];
+          await window.__agentBrowserRecordingEffects.zoomTo(300, 200, 1.5, 100);
+          const started = performance.now();
+          const finished = new Promise(resolve => {
+            const sample = () => {
+              const cursorMatrix = new DOMMatrixReadOnly(getComputedStyle(cursor).transform);
+              const cursorScale = Math.hypot(cursorMatrix.a, cursorMatrix.b);
+              const clickMatrix = new DOMMatrixReadOnly(getComputedStyle(click).transform);
+              const clickScale = Math.hypot(clickMatrix.a, clickMatrix.b);
+              const clickRingRect = clickRing.getBoundingClientRect();
+              const anchorRect = anchor.getBoundingClientRect();
+              const anchorX = anchorRect.left + anchorRect.width / 2;
+              const anchorY = anchorRect.top + anchorRect.height / 2;
+              const cursorX = cursorMatrix.m41 + Number(cursor.dataset.tipX) * cursorScale;
+              const cursorY = cursorMatrix.m42 + Number(cursor.dataset.tipY) * cursorScale;
+              samples.push({
+                cursorWidth: cursor.getBoundingClientRect().width,
+                cursorDrift: Math.hypot(cursorX - anchorX, cursorY - anchorY),
+                clickScale,
+                clickDrift: Math.hypot(
+                  clickRingRect.left + clickRingRect.width / 2 - anchorX,
+                  clickRingRect.top + clickRingRect.height / 2 - anchorY,
+                ),
+              });
+              if (performance.now() - started >= 900) resolve();
+              else requestAnimationFrame(sample);
+            };
+            requestAnimationFrame(sample);
+          });
+          await finished;
+          let maxCursorJump = 0;
+          let maxClickJump = 0;
+          for (let i = 1; i < samples.length; i += 1) {
+            maxCursorJump = Math.max(maxCursorJump, Math.abs(samples[i].cursorWidth - samples[i - 1].cursorWidth));
+            maxClickJump = Math.max(maxClickJump, Math.abs(samples[i].clickScale - samples[i - 1].clickScale));
+          }
+          return {
+            maxCursorJump,
+            maxClickJump,
+            maxCursorDrift: Math.max(...samples.map(sample => sample.cursorDrift)),
+            maxClickDrift: Math.max(...samples.map(sample => sample.clickDrift)),
+            finalWidth: samples.at(-1).cursorWidth,
+          };
+        })()
+    "#;
+    let resp = execute_command(
+        &json!({ "id": "10", "action": "evaluate", "script": continuity_script }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let continuity = &get_data(&resp)["result"];
+    assert!(
+        continuity["maxCursorJump"].as_f64().unwrap() < 4.0,
+        "temporary zoom should not snap cursor size: {continuity}"
+    );
+    assert!(
+        continuity["maxClickJump"].as_f64().unwrap() < 0.15,
+        "temporary zoom should not snap click scale: {continuity}"
+    );
+    assert!(
+        continuity["maxCursorDrift"].as_f64().unwrap() < 2.0,
+        "cursor tip should remain anchored during zoom: {continuity}"
+    );
+    assert!(
+        continuity["maxClickDrift"].as_f64().unwrap() < 2.0,
+        "click center should remain anchored during zoom: {continuity}"
+    );
+    assert!(close_to(continuity["finalWidth"].as_f64().unwrap(), 28.0));
+
+    let resp = execute_command(
+        &json!({ "id": "11", "action": "recording_stop" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let _ = std::fs::remove_file(&rec_path);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 /// Verify that an out-of-range frame rate is rejected before the recorder
 /// builds its context, leaving no file and no active recording behind.
 #[tokio::test]

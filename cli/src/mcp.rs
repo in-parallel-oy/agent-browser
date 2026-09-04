@@ -1372,7 +1372,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_START,
             "Record start",
-            "Start a Chromium screencast recording. Effect-enabled recordings add click sounds and typing sounds for animated input. Demo mode keeps each visual action ordered with its resulting browser paint, moves the cursor to input targets, and pauses between agent/tool calls so inference delays do not create idle video.",
+            "Start a Chromium screencast recording. Effect-enabled recordings add click sounds and typing sounds for animated input, and scale the synthetic cursor with camera zoom. Demo mode keeps each visual action ordered with its resulting browser paint, moves the cursor to input targets, and pauses between agent/tool calls so inference delays do not create idle video.",
             recording_tool_properties(),
             &["path"],
         ),

@@ -1054,7 +1054,7 @@ fn runtime_async_call(call: String) -> String {
 
 const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
 (() => {
-  const VERSION = 9;
+  const VERSION = 10;
   if (window.top !== window) return;
   if (window.__agentBrowserRecordingEffects?.version === VERSION) return;
 
@@ -1087,8 +1087,9 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   let zoomState = { scale: 1, originX: 0, originY: 0 };
   let zoomOriginalStyles = null;
   let installedStyle = null;
+  const activeClickEffects = new Set();
   let activeSpotlight = null;
-  let spotlightAnimationFrame = null;
+  let zoomEffectsAnimationFrame = null;
 
   function ensureRoot() {
     if (root && root.isConnected) return root;
@@ -1124,9 +1125,13 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     return { x, y };
   }
 
+  function zoomScale(state = zoomState) {
+    return Math.max(1, Math.min(3, Number(state?.scale) || 1));
+  }
+
   function copyZoomState(state = zoomState) {
     return {
-      scale: Number(state.scale) || 1,
+      scale: zoomScale(state),
       originX: Number(state.originX) || 0,
       originY: Number(state.originY) || 0,
     };
@@ -1149,10 +1154,6 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       x: z.originX + (p.x - z.originX) / scale,
       y: z.originY + (p.y - z.originY) / scale,
     };
-  }
-
-  function easeInOut(t) {
-    return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
   }
 
   function readStoredCursorPoint() {
@@ -1235,11 +1236,41 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     cursorPath.innerHTML = shape.path;
   }
 
-  function cursorTransform(point) {
+  function cursorTransform(point, state = zoomState) {
     const size = Math.max(8, Math.min(96, Number(config.cursor?.size) || 28));
     const tipX = Number(cursor?.dataset.tipX || size * 0.35);
     const tipY = Number(cursor?.dataset.tipY || size * 0.08);
-    return `translate3d(${point.x - tipX}px, ${point.y - tipY}px, 0)`;
+    const scale = zoomScale(state);
+    return `translate3d(${point.x - tipX * scale}px, ${point.y - tipY * scale}px, 0) scale(${scale})`;
+  }
+
+  function matrixScale(matrix) {
+    return Math.hypot(matrix.a, matrix.b) || 1;
+  }
+
+  function transformScale(el) {
+    if (!el) return 1;
+    const transform = getComputedStyle(el).transform;
+    if (!transform || transform === 'none') return 1;
+    try {
+      return matrixScale(new DOMMatrixReadOnly(transform));
+    } catch (_) {
+      return 1;
+    }
+  }
+
+  function currentBodyZoomState() {
+    const state = copyZoomState();
+    if (!zoomOriginalStyles) return state;
+    const bodyScale = transformScale(document.body);
+    let baseScale = 1;
+    try {
+      const base = zoomOriginalStyles.bodyTransform;
+      if (base && base !== 'none') {
+        baseScale = matrixScale(new DOMMatrixReadOnly(base));
+      }
+    } catch (_) {}
+    return { ...state, scale: zoomScale({ scale: bodyScale / baseScale }) };
   }
 
   function visualCursorPoint() {
@@ -1251,7 +1282,8 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       const size = Math.max(8, Math.min(96, Number(config.cursor?.size) || 28));
       const tipX = Number(cursor.dataset.tipX || size * 0.35);
       const tipY = Number(cursor.dataset.tipY || size * 0.08);
-      return { x: matrix.m41 + tipX, y: matrix.m42 + tipY };
+      const scale = matrixScale(matrix);
+      return { x: matrix.m41 + tipX * scale, y: matrix.m42 + tipY * scale };
     } catch (_) {
       return cursorPoint;
     }
@@ -1337,16 +1369,24 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   function burst(x, y, duration) {
     ensureRoot();
     const ms = Math.max(260, Number(duration) || 500);
+    const currentZoom = currentBodyZoomState();
     const group = document.createElement('div');
     group.setAttribute('data-agent-browser-recording-click', '');
     group.style.position = 'absolute';
-    group.style.left = `${x}px`;
-    group.style.top = `${y}px`;
+    group.style.left = '0';
+    group.style.top = '0';
     group.style.width = '0';
     group.style.height = '0';
     group.style.pointerEvents = 'none';
     group.style.zIndex = '50';
+    group.style.transformOrigin = '0 0';
     root.appendChild(group);
+    const effect = {
+      el: group,
+      contentPoint: unprojectPoint({ x: Number(x) || 0, y: Number(y) || 0 }, currentZoom),
+    };
+    group.style.transform = clickEffectTransform(effect, currentZoom);
+    activeClickEffects.add(effect);
 
     const rings = [];
     const ring = document.createElement('div');
@@ -1378,8 +1418,8 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     }
     rings.forEach((ring, i) => ring.animate(
       [
-        { transform: 'translate(-50%, -50%) scale(.45)', opacity: .75 },
-        { transform: 'translate(-50%, -50%) scale(2.8)', opacity: 0 },
+        { transform: 'scale(.45)', opacity: .75 },
+        { transform: 'scale(2.8)', opacity: 0 },
       ],
       { duration: ms, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
     ));
@@ -1397,7 +1437,15 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
         { duration: ms, delay: 25 + i * 14, easing: 'cubic-bezier(0, 0, 0.2, 1)', fill: 'forwards' }
       );
     });
-    setTimeout(() => group.remove(), ms + 360);
+    setTimeout(() => {
+      activeClickEffects.delete(effect);
+      group.remove();
+    }, ms + 360);
+  }
+
+  function clickEffectTransform(effect, state = zoomState) {
+    const point = projectPoint(effect.contentPoint, state);
+    return `translate3d(${point.x}px, ${point.y}px, 0) scale(${zoomScale(state)})`;
   }
 
   async function click(x, y) {
@@ -1518,8 +1566,6 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   function spotlight(x, y, durationMs = 1200, radius = null) {
     ensureRoot();
     root.querySelectorAll('[data-agent-browser-recording-spotlight]').forEach(el => el.remove());
-    if (spotlightAnimationFrame !== null) cancelAnimationFrame(spotlightAnimationFrame);
-    spotlightAnimationFrame = null;
     activeSpotlight = null;
     const el = document.createElement('div');
     el.setAttribute('data-agent-browser-recording-spotlight', '');
@@ -1573,59 +1619,70 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     overlayGeneration += 1;
     root.querySelectorAll('[data-agent-browser-recording-overlay], [data-agent-browser-recording-key], [data-agent-browser-recording-spotlight]').forEach(el => el.remove());
     activeSpotlight = null;
-    if (spotlightAnimationFrame !== null) cancelAnimationFrame(spotlightAnimationFrame);
-    spotlightAnimationFrame = null;
     overlayChain = Promise.resolve();
   }
 
+  // Sample the body's rendered transform so every synthetic effect follows
+  // Chromium's camera animation clock and remains anchored between frames.
   function animateAnchoredEffects(fromZoom, toZoom, durationMs = 600) {
     const duration = Math.max(0, Number(durationMs) || 0);
+    const applyZoom = state => {
+      if (cursorContentPoint && cursorVisible) {
+        const el = ensureCursor();
+        if (el) {
+          const point = projectPoint(cursorContentPoint, state);
+          el.style.opacity = '1';
+          el.style.transform = cursorTransform(point, state);
+          cursorPoint = point;
+        }
+      }
+      for (const effect of [...activeClickEffects]) {
+        if (!effect.el.isConnected) activeClickEffects.delete(effect);
+        else effect.el.style.transform = clickEffectTransform(effect, state);
+      }
+      if (activeSpotlight?.el?.isConnected) {
+        setSpotlightPosition(activeSpotlight, projectPoint(activeSpotlight.contentPoint, state));
+      }
+    };
     if (cursorContentPoint && cursorVisible) {
       const el = ensureCursor();
       if (el) {
-        const from = visualCursorPoint() || projectPoint(cursorContentPoint, fromZoom);
-        const to = projectPoint(cursorContentPoint, toZoom);
-        const generation = ++cursorMoveGeneration;
+        cursorMoveGeneration += 1;
         cursorAnimation?.cancel();
+        cursorAnimation = null;
+        const from = visualCursorPoint() || projectPoint(cursorContentPoint, fromZoom);
         el.style.opacity = '1';
-        el.style.transform = cursorTransform(from);
-        cursorAnimation = el.animate(
-          [
-            { transform: cursorTransform(from), opacity: 1 },
-            { transform: cursorTransform(to), opacity: 1 },
-          ],
-          { duration, easing: 'cubic-bezier(0.4, 0, 0.2, 1)', fill: 'forwards' }
-        );
-        cursorAnimation.finished.catch(() => {}).then(() => {
-          if (generation !== cursorMoveGeneration) return;
-          el.style.opacity = '1';
-          el.style.transform = cursorTransform(to);
-          cursorPoint = to;
-          writeStoredCursorPoint(cursorContentPoint);
-        });
+        el.style.transform = cursorTransform(from, fromZoom);
       }
     }
-    if (activeSpotlight?.el?.isConnected) {
-      if (spotlightAnimationFrame !== null) cancelAnimationFrame(spotlightAnimationFrame);
-      const start = performance.now();
-      const tick = now => {
-        if (!activeSpotlight?.el?.isConnected) {
-          spotlightAnimationFrame = null;
-          return;
-        }
-        const t = duration === 0 ? 1 : Math.min(1, (now - start) / duration);
-        const eased = easeInOut(t);
-        const interpolated = {
-          scale: fromZoom.scale + (toZoom.scale - fromZoom.scale) * eased,
-          originX: fromZoom.originX + (toZoom.originX - fromZoom.originX) * eased,
-          originY: fromZoom.originY + (toZoom.originY - fromZoom.originY) * eased,
-        };
-        setSpotlightPosition(activeSpotlight, projectPoint(activeSpotlight.contentPoint, interpolated));
-        if (t < 1) spotlightAnimationFrame = requestAnimationFrame(tick);
-        else spotlightAnimationFrame = null;
-      };
-      spotlightAnimationFrame = requestAnimationFrame(tick);
+    for (const effect of [...activeClickEffects]) {
+      if (!effect.el.isConnected) {
+        activeClickEffects.delete(effect);
+        continue;
+      }
+      effect.el.style.transform = clickEffectTransform(effect, fromZoom);
     }
+    if (activeSpotlight?.el?.isConnected) {
+      setSpotlightPosition(activeSpotlight, projectPoint(activeSpotlight.contentPoint, fromZoom));
+    }
+    if (zoomEffectsAnimationFrame !== null) cancelAnimationFrame(zoomEffectsAnimationFrame);
+    if (duration === 0) {
+      applyZoom(toZoom);
+      writeStoredCursorPoint(cursorContentPoint);
+      return;
+    }
+    const start = performance.now();
+    const tick = now => {
+      if (now - start >= duration) {
+        applyZoom(toZoom);
+        writeStoredCursorPoint(cursorContentPoint);
+        zoomEffectsAnimationFrame = null;
+        return;
+      }
+      applyZoom(currentBodyZoomState());
+      zoomEffectsAnimationFrame = requestAnimationFrame(tick);
+    };
+    zoomEffectsAnimationFrame = requestAnimationFrame(tick);
   }
 
   function nextAnimationFrame() {
@@ -1678,7 +1735,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
   }
 
   async function zoomTo(x, y, scale, durationMs = null) {
-    const s = Math.max(1, Math.min(3, Number(scale) || 1));
+    const s = zoomScale({ scale });
     clearTimeout(zoomResetTimer);
     zoomGeneration += 1;
     const generation = zoomGeneration;
@@ -1699,7 +1756,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       originX = Math.max(0, Math.min(vw, originX));
       originY = Math.max(0, Math.min(vh, originY));
     }
-    const fromZoom = copyZoomState();
+    const fromZoom = currentBodyZoomState();
     const toZoom = { scale: s, originX, originY };
     document.documentElement.style.overflow = 'hidden';
     body.style.overflow = 'hidden';
@@ -1737,9 +1794,9 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       await nextAnimationFrame();
       if (generation !== zoomGeneration) return;
     }
+    const fromZoom = currentBodyZoomState();
     body.style.transition = 'transform 600ms cubic-bezier(0.4, 0, 0.2, 1)';
     body.style.transform = zoomOriginalStyles?.bodyTransform || 'scale(1)';
-    const fromZoom = copyZoomState();
     const toZoom = { scale: 1, originX: fromZoom.originX, originY: fromZoom.originY };
     zoomState = toZoom;
     animateAnchoredEffects(fromZoom, toZoom, 600);
@@ -1764,9 +1821,10 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     overlayChain = Promise.resolve();
     zoomGeneration += 1;
     zoomState = { scale: 1, originX: 0, originY: 0 };
+    activeClickEffects.clear();
     activeSpotlight = null;
-    if (spotlightAnimationFrame !== null) cancelAnimationFrame(spotlightAnimationFrame);
-    spotlightAnimationFrame = null;
+    if (zoomEffectsAnimationFrame !== null) cancelAnimationFrame(zoomEffectsAnimationFrame);
+    zoomEffectsAnimationFrame = null;
     restoreZoomStyles();
   }
 

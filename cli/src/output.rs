@@ -2831,6 +2831,8 @@ Click records cursor flight plus click ripple only. Use explicit `record zoom`
 and `record overlay` commands for presentation emphasis. The default cursor
 preset renders effects in the recorded page. Effects are registered for future
 documents while recording is active, so they come back after navigation.
+The cursor and click ripple scale with camera zoom while the pointer tip stays
+anchored to its target.
 Text overlays serialize, stay visible for --duration-ms, and auto-dismiss
 before the next command continues. Spotlight stays visible for --duration-ms;
 selector targets derive radius from the target box, and any target can pass
