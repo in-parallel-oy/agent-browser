@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{EvaluateParams, EvaluateResult};
+use super::recording::RecordingSoundHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordEffectsPreset {
@@ -312,7 +313,7 @@ impl RecordingEffectsConfig {
             mode,
             cursor,
             input_mode,
-            input_delay_ms: input_delay_ms.unwrap_or_else(|| {
+            input_delay_ms: input_delay_ms.unwrap_or({
                 if matches!(input_mode, InputMode::Animated) {
                     35
                 } else {
@@ -380,6 +381,7 @@ pub struct RecordingEffectsState {
     cursor_point: Option<(f64, f64)>,
     pending_move: Option<(f64, f64)>,
     move_flush_scheduled: bool,
+    sound: Option<RecordingSoundHandle>,
 }
 
 impl RecordingEffectsState {
@@ -394,6 +396,7 @@ impl RecordingEffectsState {
             cursor_point: None,
             pending_move: None,
             move_flush_scheduled: false,
+            sound: None,
         }
     }
 
@@ -414,6 +417,10 @@ impl RecordingEffectsState {
     pub fn set_device_scale_factor(&mut self, _scale: f64) {
         // DOM-rendered effects use CSS pixels in the page. The captured screenshot path
         // already accounts for the browser device scale factor.
+    }
+
+    pub fn set_sound_handle(&mut self, sound: Option<RecordingSoundHandle>) {
+        self.sound = sound;
     }
 
     pub async fn install(&mut self) -> Result<(), String> {
@@ -894,16 +901,30 @@ impl RecordingEffectsHandle {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+        let sound = self.shared.lock().await.sound.clone();
+        if let Some(sound) = sound {
+            sound.click();
+        }
     }
 
     pub async fn key(&self, label: String) {
-        let runtime = {
+        let (runtime, sound, sound_duration) = {
             let mut guard = self.shared.lock().await;
             guard.key(label.clone());
-            guard.runtime()
+            let sound_duration = if matches!(guard.config.input_mode, InputMode::Animated) {
+                Duration::from_millis(
+                    (label.chars().count() as u64).saturating_mul(guard.config.input_delay_ms),
+                )
+            } else {
+                Duration::ZERO
+            };
+            (guard.runtime(), guard.sound.clone(), sound_duration)
         };
         if let Some(runtime) = runtime {
             let _ = runtime.key(&label).await;
+        }
+        if let Some(sound) = sound {
+            sound.keyboard_ending_now(sound_duration);
         }
     }
 
@@ -1653,6 +1674,8 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
     const vh = window.innerHeight || document.documentElement.clientHeight || 1;
     const cx = Number(x) || 0;
     const cy = Number(y) || vh;
+    const scrollX = window.scrollX || window.pageXOffset || 0;
+    const scrollY = window.scrollY || window.pageYOffset || 0;
     let originX = 0;
     let originY = vh;
     if (s !== 1) {
@@ -1669,7 +1692,7 @@ const RECORDING_EFFECTS_RUNTIME_JS: &str = r#"
       document.documentElement.style.background = zoomOriginalStyles.background;
       body.style.background = zoomOriginalStyles.background;
     }
-    body.style.transformOrigin = `${originX}px ${originY}px`;
+    body.style.transformOrigin = `${originX + scrollX}px ${originY + scrollY}px`;
     body.style.transition = 'none';
     body.style.willChange = 'transform';
     body.style.transform = zoomBodyTransform(1);
@@ -1949,6 +1972,8 @@ mod tests {
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-click"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("data-agent-browser-recording-spotlight"));
         assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("body.style.transformOrigin"));
+        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("window.scrollX"));
+        assert!(RECORDING_EFFECTS_RUNTIME_JS.contains("originY + scrollY"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("body.style.transform = `scale"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("while (body.firstChild)"));
         assert!(!RECORDING_EFFECTS_RUNTIME_JS.contains("composite_frame"));

@@ -8,7 +8,9 @@ Capture browser automation as video for debugging, documentation, or verificatio
 
 - [Basic Recording](#basic-recording)
 - [Recording Commands](#recording-commands)
+- [Frame Rate](#frame-rate)
 - [Recording Effects](#recording-effects)
+- [Sound Effects](#sound-effects)
 - [Use Cases](#use-cases)
 - [Best Practices](#best-practices)
 - [Output Format](#output-format)
@@ -36,19 +38,45 @@ agent-browser record stop
 # Launch a session first
 agent-browser open
 
-# Start recording to file
+# Start recording to file (30 fps)
 agent-browser record start ./output.webm
+
+# Start recording at a specific rate (1-60)
+agent-browser record start ./output.webm --fps 60
 
 # Stop current recording
 agent-browser record stop
 
 # Restart with new file (stops current + starts new)
-agent-browser record restart ./take2.webm
+agent-browser record restart ./take2.webm --fps 60
 ```
+
+## Frame Rate
+
+Recording captures 30 fps by default, so scrolling, hover states, and CSS transitions read as motion instead of a slideshow. `--fps` takes any rate from 1 to 60.
+
+| Rate | Use it for |
+| --- | --- |
+| 60 | Short, motion-heavy takes: drag interactions, animation, scroll polish work |
+| 30 (default) | Flows, CI evidence, walkthroughs |
+| 1-15 | Long sessions where the video is a timeline, not a motion study |
+
+```bash
+# Animation review
+agent-browser record start ./transition.webm --fps 60
+agent-browser click @e1
+agent-browser wait 1500
+agent-browser record stop
+
+# Hour-long soak run
+agent-browser record start ./soak.webm --fps 5
+```
+
+Frames come from Chrome's screencast, so a 60 fps take of a scroll holds 60 distinct pictures per second. While the page is static the last frame is held, so duration matches wall clock; a gap longer than five seconds is held for five and the rest left out. `record stop --json` reports `frames` (written) and `capturedFrames` (distinct frames the page produced). 60 fps roughly doubles the bitrate of 30 fps.
 
 ## Recording Effects
 
-The OS cursor is never visible in `record start` output because CDP `Page.captureScreenshot` renders the page DOM only, with no OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. Recording captures the current live page directly, preserving browser state and in-page animation instead of cloning into a separate recording context. Effects are injected into the recorded page and registered for future documents while recording is active, so they come back after navigation. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
+The OS cursor is never visible in `record start` output because Chromium's `Page.startScreencast` captures page frames without the OS cursor. Recording effects are **on by default** with the `cursor` preset and `arrow` theme. Recording uses a fresh browser context, copies cookies from the active session, and injects effects into the recording page. The effects are registered for future documents while recording is active, so they come back after navigation. Pass `--record-mode demo` for presentation timing defaults. Pass `--record-effects off` or `--no-cursor` to disable synthetic effects.
 
 ```bash
 # Default: arrow cursor, 250ms tween, 400ms click ripple, 28px
@@ -104,7 +132,11 @@ agent-browser record zoom to --x 640 --y 360 --scale 1.45
 agent-browser record zoom reset
 ```
 
-Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, stay visible for `--duration-ms`, and auto-dismiss before the next command continues. Spotlight holds for `--duration-ms`; selector targets derive radius from the element box, and any target can pass `--radius` to override it. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. `record zoom to` waits for the camera transition, and `record zoom reset` waits for the reset transition, so compact command batches naturally capture the zoom animation. Use `record stop` to save and `record abort` to discard. Recordings are silent; narration and SFX are not mixed into the screenshot-plus-ffmpeg pipeline.
+Spotlight and zoom accept either a selector/ref target or explicit `--x`/`--y` viewport coordinates. Text overlays serialize, stay visible for `--duration-ms`, and auto-dismiss before the next command continues. Spotlight holds for `--duration-ms`; selector targets derive radius from the element box, and any target can pass `--radius` to override it. Zoom holds until `record zoom reset`; pass `--duration-ms` for a temporary zoom. `record zoom to` waits for the camera transition, and `record zoom reset` waits for the reset transition, so compact command batches naturally capture the zoom animation. Use `record stop` to save and `record abort` to discard.
+
+## Sound Effects
+
+Effect-enabled recordings add bundled click sounds and typing sounds for animated input. `record stop` builds the interaction soundtrack on the same frame clock as the recording, then copies the Chromium-rendered video stream into the final file without re-encoding it. Page audio, narration, and system audio are not captured. `--record-effects off` and `--no-cursor` also disable the interaction soundtrack.
 
 ### Sync Model
 
@@ -120,6 +152,7 @@ For compact demos, open and settle the page before recording when initial load i
 - **Page-injected effects.** Effect-enabled recordings install a temporary recording layer into the captured page. It is removed when recording stops.
 - **Frame coordinates.** Element centers are resolved through the active frame, then sent to the recording layer. Complex transformed iframe layouts may need verification in the final artifact.
 - **`record restart` starts a new effects timeline.** Any active overlay or zoom is cleared when recording restarts.
+- **Interaction audio only.** Recording does not capture page audio, narration, or system audio.
 
 ## Use Cases
 
@@ -241,11 +274,14 @@ agent-browser record stop
 ## Output Format
 
 - Default format: WebM (VP8/VP9 codec)
+- Default frame rate: 30 fps (`--fps` accepts 1 to 60)
+- Audio: click sounds and animated-input typing sounds when recording effects are enabled
 - Compatible with all modern browsers and video players
 - Compressed but high quality
 
 ## Limitations
 
-- Recording adds slight overhead to automation
-- Large recordings can consume significant disk space
+- Recording adds slight overhead to automation, and higher frame rates add more
+- Large recordings can consume significant disk space; 60 fps roughly doubles the bitrate of 30 fps
+- Distinct frames per second are bounded by how often the page repaints, so a page rendering below 60 fps records below it too
 - Some headless environments may have codec limitations

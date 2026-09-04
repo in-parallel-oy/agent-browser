@@ -71,6 +71,114 @@ pub fn gen_id() -> String {
     )
 }
 
+/// Normalize browser navigation inputs while preserving schemes Chrome can
+/// open directly. Bare hostnames use HTTPS, matching the `open` command.
+fn normalize_navigation_url(url: &str) -> String {
+    let url_lower = url.to_lowercase();
+    if url_lower.starts_with("http://")
+        || url_lower.starts_with("https://")
+        || url_lower.starts_with("about:")
+        || url_lower.starts_with("data:")
+        || url_lower.starts_with("file:")
+        || url_lower.starts_with("chrome-extension://")
+        || url_lower.starts_with("chrome://")
+    {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    }
+}
+
+pub fn is_top_level_command(value: &str) -> bool {
+    matches!(
+        value,
+        "open"
+            | "goto"
+            | "navigate"
+            | "back"
+            | "forward"
+            | "reload"
+            | "read"
+            | "click"
+            | "dblclick"
+            | "fill"
+            | "type"
+            | "hover"
+            | "focus"
+            | "check"
+            | "uncheck"
+            | "select"
+            | "drag"
+            | "upload"
+            | "download"
+            | "press"
+            | "key"
+            | "keydown"
+            | "keyup"
+            | "keyboard"
+            | "scroll"
+            | "scrollintoview"
+            | "scrollinto"
+            | "wait"
+            | "screenshot"
+            | "pdf"
+            | "snapshot"
+            | "eval"
+            | "close"
+            | "quit"
+            | "exit"
+            | "inspect"
+            | "auth"
+            | "confirm"
+            | "deny"
+            | "connect"
+            | "stream"
+            | "get"
+            | "is"
+            | "find"
+            | "mouse"
+            | "set"
+            | "network"
+            | "storage"
+            | "cookies"
+            | "tab"
+            | "window"
+            | "frame"
+            | "dialog"
+            | "trace"
+            | "profiler"
+            | "record"
+            | "console"
+            | "errors"
+            | "highlight"
+            | "clipboard"
+            | "state"
+            | "tap"
+            | "swipe"
+            | "device"
+            | "diff"
+            | "batch"
+            | "react"
+            | "vitals"
+            | "web-vitals"
+            | "a11y"
+            | "pushstate"
+            | "removeinitscript"
+            | "session"
+            | "mcp"
+            | "doctor"
+            | "install"
+            | "upgrade"
+            | "profiles"
+            | "skills"
+            | "dashboard"
+            | "plugin"
+            | "plugins"
+            | "chat"
+            | "webmcp"
+    )
+}
+
 /// Parse a cookies file in one of three auto-detected formats:
 ///
 /// 1. JSON array — `[{"name":"x","value":"y"}, ...]`
@@ -233,8 +341,21 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
             }
         }
     }
+    attach_ca_cert_to_launch_command(&mut result, flags);
 
     Ok(result)
+}
+
+pub fn attach_ca_cert_to_launch_command(cmd: &mut Value, flags: &Flags) {
+    if cmd.get("action").and_then(Value::as_str) != Some("launch") {
+        return;
+    }
+    if let Some(ref ca) = flags.ca_cert {
+        cmd["caCert"] = json!(ca);
+    }
+    if flags.clear_ca_cert {
+        cmd["clearCaCert"] = json!(true);
+    }
 }
 
 fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
@@ -278,19 +399,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     });
                 }
             };
-            let url_lower = url.to_lowercase();
-            let url = if url_lower.starts_with("http://")
-                || url_lower.starts_with("https://")
-                || url_lower.starts_with("about:")
-                || url_lower.starts_with("data:")
-                || url_lower.starts_with("file:")
-                || url_lower.starts_with("chrome-extension://")
-                || url_lower.starts_with("chrome://")
-            {
-                url.to_string()
-            } else {
-                format!("https://{}", url)
-            };
+            let url = normalize_navigation_url(url);
             let mut nav_cmd = json!({ "id": id, "action": "navigate", "url": url });
             if flags.provider.is_some() {
                 nav_cmd["waitUntil"] = json!("none");
@@ -316,6 +425,8 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         "back" => Ok(json!({ "id": id, "action": "back" })),
         "forward" => Ok(json!({ "id": id, "action": "forward" })),
         "reload" => Ok(json!({ "id": id, "action": "reload" })),
+        "read" => parse_read(&rest, &id, flags),
+        "webmcp" => parse_webmcp(&rest, &id),
 
         // === Core Actions ===
         "click" => {
@@ -1565,7 +1676,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     let parsed = split_record_args(&rest[1..], "record start")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url] [--record-effects <cursor|demo|off>] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record start <output.webm> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
@@ -1607,7 +1718,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     let parsed = split_record_args(&rest[1..], "record restart")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url] [--record-effects <cursor|demo|off>] [--record-fps <n>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: "record restart <output.webm> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
                     })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
@@ -1648,7 +1759,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 }),
                 None => Err(ParseError::MissingArguments {
                     context: "record".to_string(),
-                    usage: "record <start|stop|restart> [path] [url]",
+                    usage: "record <start|stop|restart> [path] [url] [--fps <n>]",
                 }),
             }
         }
@@ -1882,6 +1993,65 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(cmd)
         }
 
+        // === Accessibility audit (axe-core) ===
+        "a11y" => {
+            const A11Y_USAGE: &str = "a11y [url] [--tags <tag1,tag2>] [--selector <css>] [--json]";
+            let mut cmd = json!({ "id": id, "action": "a11y" });
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--tags" => {
+                        i += 1;
+                        let value = rest
+                            .get(i)
+                            .copied()
+                            .filter(|value| {
+                                !matches!(*value, "--tags" | "--selector" | "-s" | "--json")
+                            })
+                            .ok_or(ParseError::MissingArguments {
+                                context: "a11y --tags".to_string(),
+                                usage: A11Y_USAGE,
+                            })?;
+                        cmd["tags"] = json!(value);
+                    }
+                    "--selector" | "-s" => {
+                        i += 1;
+                        let value = rest
+                            .get(i)
+                            .copied()
+                            .filter(|value| {
+                                !matches!(*value, "--tags" | "--selector" | "-s" | "--json")
+                            })
+                            .ok_or(ParseError::MissingArguments {
+                                context: "a11y --selector".to_string(),
+                                usage: A11Y_USAGE,
+                            })?;
+                        cmd["selector"] = json!(value);
+                    }
+                    "--json" => {
+                        cmd["json"] = json!(true);
+                    }
+                    other if !other.starts_with('-') => {
+                        if cmd.get("url").is_some() {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("Unexpected argument: {}", other),
+                                usage: A11Y_USAGE,
+                            });
+                        }
+                        cmd["url"] = json!(normalize_navigation_url(other));
+                    }
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown flag: {}", other),
+                            usage: A11Y_USAGE,
+                        });
+                    }
+                }
+                i += 1;
+            }
+            Ok(cmd)
+        }
+
         // === SPA client-side navigation ===
         "pushstate" => {
             let url = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -1906,6 +2076,317 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
     }
 }
 
+fn parse_webmcp(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    let subcommand = rest.first().ok_or_else(|| ParseError::MissingArguments {
+        context: "webmcp".to_string(),
+        usage: "webmcp <list|invoke|result|cancel>",
+    })?;
+    match *subcommand {
+        "list" => {
+            if let Some(argument) = rest.get(1) {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unexpected argument for webmcp list: {}", argument),
+                    usage: "webmcp list",
+                });
+            }
+            Ok(json!({ "id": id, "action": "webmcp_list" }))
+        }
+        "invoke" => {
+            let tool = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "webmcp invoke".to_string(),
+                usage: "webmcp invoke <tool> [--params <json|@file>] [--frame <frame-id>] [--detach] [--timeout <ms>]",
+            })?;
+            let mut command = json!({
+                "id": id,
+                "action": "webmcp_invoke",
+                "tool": tool,
+                "params": {},
+            });
+            let mut index = 2;
+            while index < rest.len() {
+                match rest[index] {
+                    "--params" => {
+                        let raw = rest.get(index + 1).ok_or_else(|| {
+                            ParseError::MissingArguments {
+                                context: "webmcp invoke --params".to_string(),
+                                usage: "webmcp invoke <tool> [--params <json|@file>] [--frame <frame-id>] [--detach] [--timeout <ms>]",
+                            }
+                        })?;
+                        let payload = if let Some(path) = raw.strip_prefix('@') {
+                            let metadata =
+                                std::fs::metadata(path).map_err(|error| ParseError::InvalidValue {
+                                    message: format!(
+                                        "Unable to read WebMCP params file '{}': {}",
+                                        path, error
+                                    ),
+                                    usage: "webmcp invoke <tool> --params @input.json",
+                                })?;
+                            if metadata.len() as usize > crate::native::webmcp::MAX_INPUT_BYTES {
+                                return Err(ParseError::InvalidValue {
+                                    message: format!(
+                                        "WebMCP params file is {} bytes; maximum is {} bytes",
+                                        metadata.len(),
+                                        crate::native::webmcp::MAX_INPUT_BYTES
+                                    ),
+                                    usage: "webmcp invoke <tool> --params @input.json",
+                                });
+                            }
+                            std::fs::read_to_string(path).map_err(|error| {
+                                ParseError::InvalidValue {
+                                    message: format!(
+                                        "Unable to read WebMCP params file '{}': {}",
+                                        path, error
+                                    ),
+                                    usage: "webmcp invoke <tool> --params @input.json",
+                                }
+                            })?
+                        } else {
+                            raw.to_string()
+                        };
+                        let params: Value = serde_json::from_str(&payload).map_err(|error| {
+                            ParseError::InvalidValue {
+                                message: format!("Invalid JSON for --params: {}", error),
+                                usage: "webmcp invoke <tool> --params '{\"key\":\"value\"}'",
+                            }
+                        })?;
+                        crate::native::webmcp::validate_input(&params).map_err(|message| {
+                            ParseError::InvalidValue {
+                                message,
+                                usage: "webmcp invoke <tool> --params <json|@file>",
+                            }
+                        })?;
+                        command["params"] = params;
+                        index += 1;
+                    }
+                    "--frame" => {
+                        let frame = rest.get(index + 1).ok_or_else(|| {
+                            ParseError::MissingArguments {
+                                context: "webmcp invoke --frame".to_string(),
+                                usage: "webmcp invoke <tool> --frame <frame-id>",
+                            }
+                        })?;
+                        command["frameId"] = json!(frame);
+                        index += 1;
+                    }
+                    "--detach" => command["detach"] = json!(true),
+                    "--timeout" => {
+                        let raw = rest.get(index + 1).ok_or_else(|| {
+                            ParseError::MissingArguments {
+                                context: "webmcp invoke --timeout".to_string(),
+                                usage: "webmcp invoke <tool> --timeout <ms>",
+                            }
+                        })?;
+                        let timeout =
+                            raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                                message: format!(
+                                    "--timeout expects a number in ms, got '{}'",
+                                    raw
+                                ),
+                                usage: "webmcp invoke <tool> --timeout <ms>",
+                            })?;
+                        command["timeout"] = json!(timeout);
+                        index += 1;
+                    }
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown webmcp invoke option: {}", other),
+                            usage: "webmcp invoke <tool> [--params <json|@file>] [--frame <frame-id>] [--detach] [--timeout <ms>]",
+                        })
+                    }
+                }
+                index += 1;
+            }
+            Ok(command)
+        }
+        "result" => {
+            let invocation_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "webmcp result".to_string(),
+                usage: "webmcp result <invocation-id> [--timeout <ms>]",
+            })?;
+            let mut command = json!({
+                "id": id,
+                "action": "webmcp_result",
+                "invocationId": invocation_id,
+            });
+            let mut index = 2;
+            while index < rest.len() {
+                match rest[index] {
+                    "--timeout" => {
+                        let raw =
+                            rest.get(index + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: "webmcp result --timeout".to_string(),
+                                    usage: "webmcp result <invocation-id> --timeout <ms>",
+                                })?;
+                        command["timeout"] =
+                            json!(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                                message: format!("--timeout expects a number in ms, got '{}'", raw),
+                                usage: "webmcp result <invocation-id> --timeout <ms>",
+                            })?);
+                        index += 1;
+                    }
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown webmcp result option: {}", other),
+                            usage: "webmcp result <invocation-id> [--timeout <ms>]",
+                        });
+                    }
+                }
+                index += 1;
+            }
+            Ok(command)
+        }
+        "cancel" => {
+            let invocation_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "webmcp cancel".to_string(),
+                usage: "webmcp cancel <invocation-id>",
+            })?;
+            if let Some(argument) = rest.get(2) {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unexpected argument for webmcp cancel: {}", argument),
+                    usage: "webmcp cancel <invocation-id>",
+                });
+            }
+            Ok(json!({
+                "id": id,
+                "action": "webmcp_cancel",
+                "invocationId": invocation_id,
+            }))
+        }
+        _ => Err(ParseError::UnknownSubcommand {
+            subcommand: subcommand.to_string(),
+            valid_options: &["list", "invoke", "result", "cancel"],
+        }),
+    }
+}
+
+fn parse_read(rest: &[&str], id: &str, flags: &Flags) -> Result<Value, ParseError> {
+    const READ_USAGE: &str =
+        "read [url] [--raw] [--require-md] [--llms <index|full>] [--outline] [--filter <text>] [--timeout <ms>]";
+    let mut cmd = json!({
+        "id": id,
+        "action": "read",
+        "timeout": crate::read::default_timeout_ms(),
+    });
+    let mut url: Option<&str> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--raw" => {
+                cmd["raw"] = json!(true);
+            }
+            "--require-md" => {
+                cmd["requireMd"] = json!(true);
+            }
+            "--llms" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "read --llms".to_string(),
+                        usage: READ_USAGE,
+                    })?;
+                crate::read::parse_llms_mode(value).map_err(|message| {
+                    ParseError::InvalidValue {
+                        message,
+                        usage: READ_USAGE,
+                    }
+                })?;
+                cmd["llms"] = json!(value);
+                i += 1;
+            }
+            "--outline" => {
+                cmd["outline"] = json!(true);
+            }
+            "--filter" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "read --filter".to_string(),
+                        usage: READ_USAGE,
+                    })?;
+                cmd["filter"] = json!(value);
+                i += 1;
+            }
+            "--timeout" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "read --timeout".to_string(),
+                        usage: READ_USAGE,
+                    })?;
+                let timeout = crate::read::parse_timeout_ms(value).map_err(|message| {
+                    ParseError::InvalidValue {
+                        message,
+                        usage: READ_USAGE,
+                    }
+                })?;
+                cmd["timeout"] = json!(timeout);
+                i += 1;
+            }
+            "--json" => {
+                cmd["json"] = json!(true);
+            }
+            arg if arg.starts_with("--") => {
+                return Err(ParseError::UnknownSubcommand {
+                    subcommand: arg.to_string(),
+                    valid_options: &[
+                        "--raw",
+                        "--require-md",
+                        "--llms",
+                        "--outline",
+                        "--filter",
+                        "--timeout",
+                        "--json",
+                    ],
+                });
+            }
+            arg => {
+                if url.is_some() {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("Unexpected read argument: {}", arg),
+                        usage: READ_USAGE,
+                    });
+                }
+                url = Some(arg);
+            }
+        }
+        i += 1;
+    }
+    if cmd.get("llms").is_some()
+        && cmd
+            .get("outline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return Err(ParseError::InvalidValue {
+            message: "read --llms and --outline cannot be used together".to_string(),
+            usage: READ_USAGE,
+        });
+    }
+    if let Some(url) = url {
+        cmd["url"] = json!(url);
+    }
+    if let Some(ref headers_json) = flags.headers {
+        let headers = serde_json::from_str::<serde_json::Value>(headers_json).map_err(|_| {
+            ParseError::InvalidValue {
+                message: format!("Invalid JSON for --headers: {}", headers_json),
+                usage: READ_USAGE,
+            }
+        })?;
+        if !headers.is_object() {
+            return Err(ParseError::InvalidValue {
+                message: format!("Invalid JSON object for --headers: {}", headers_json),
+                usage: READ_USAGE,
+            });
+        }
+        cmd["headers"] = headers;
+    }
+    if let Some(ref allowed_domains) = flags.allowed_domains {
+        cmd["allowedDomains"] = json!(allowed_domains);
+    }
+    Ok(cmd)
+}
+
 /// Result of `split_record_args`: positional args (path, optional url),
 /// optional `cursor` JSON object, optional capture-fps override.
 struct RecordArgs<'a> {
@@ -1922,15 +2403,15 @@ struct RecordArgs<'a> {
 /// Split a `record start`/`record restart` argument list into positional
 /// args (path, optional url) and the optional flag-driven overrides.
 ///
-/// Recognised flags: `--record-fps <n>`; effects:
+/// Recognised flags: `--fps <n>` (with `--record-fps` accepted as a legacy alias); effects:
 /// `--record-effects <cursor|demo|off>`; cursor: `--cursor <theme>`,
 /// `--cursor-tween-ms <n>`, `--cursor-click-ms <n>`, `--cursor-size <n>`,
 /// `--cursor-motion <mode>`, `--cursor-block-clicks`, `--no-cursor`.
 ///
 /// **Cursor default is ON** with the `arrow` theme. Pass `--no-cursor` to
 /// disable. Tuning flags (`--cursor-tween-ms`, etc.) without `--cursor`
-/// implicitly select the `arrow` theme rather than erroring -- the user
-/// clearly wants the cursor; we just fill in the default theme.
+/// implicitly select the `arrow` theme. The user clearly wants the cursor,
+/// so the parser fills in the default theme.
 /// `--cursor` and `--no-cursor` together is a parse error.
 fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArgs<'a>, ParseError> {
     let mut positional: Vec<&str> = Vec::new();
@@ -1947,21 +2428,21 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
     while i < args.len() {
         let tok = args[i];
         match tok {
-            "--record-fps" => {
+            "--fps" | "--record-fps" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| ParseError::MissingArguments {
-                        context: format!("{} --record-fps", context),
-                        usage: "record start <output> [url] --record-fps <integer 1-60>",
+                        context: format!("{} --fps", context),
+                        usage: "record start <output> [url] --fps <integer 1-60>",
                     })?;
                 let n: u32 = v.parse().map_err(|_| ParseError::InvalidValue {
-                    message: format!("--record-fps expects a non-negative integer (got '{}')", v),
-                    usage: "record start <output> [url] --record-fps <integer 1-60>",
+                    message: format!("--fps expects a non-negative integer (got '{}')", v),
+                    usage: "record start <output> [url] --fps <integer 1-60>",
                 })?;
                 if !(1..=60).contains(&n) {
                     return Err(ParseError::InvalidValue {
-                        message: format!("--record-fps must be between 1 and 60 (got {})", n),
-                        usage: "record start <output> [url] --record-fps <integer 1-60>",
+                        message: format!("--fps must be between 1 and 60 (got {})", n),
+                        usage: "record start <output> [url] --fps <integer 1-60>",
                     });
                 }
                 fps = Some(n);
@@ -2123,6 +2604,18 @@ fn split_record_args<'a>(args: &'a [&'a str], context: &str) -> Result<RecordArg
                 })?;
                 input_delay_ms = Some(n);
                 i += 2;
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown flag for {}: {}", context, unknown),
+                    usage: "record start <output> [url] [options]",
+                });
+            }
+            _ if positional.len() >= 2 => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unexpected argument for {}: {}", context, tok),
+                    usage: "record start <output> [url] [options]",
+                });
             }
             _ => {
                 positional.push(tok);
@@ -2508,7 +3001,7 @@ fn validate_record_point_args(
             usage,
         });
     }
-    if !has_selector && !(has_x && has_y) {
+    if !(has_selector || has_x && has_y) {
         return Err(ParseError::MissingArguments {
             context: context.to_string(),
             usage,
@@ -3003,11 +3496,11 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: format!("find {}", locator),
                 usage: match *locator {
                     "role" => "find role <role> [action] [--name <name>] [--exact]",
-                    "text" => "find text <text> [action] [--exact]",
+                    "text" => "find text <text> [action] [value] [--exact]",
                     "label" => "find label <label> [action] [text] [--exact]",
                     "placeholder" => "find placeholder <text> [action] [text] [--exact]",
-                    "alt" => "find alt <text> [action] [--exact]",
-                    "title" => "find title <text> [action] [--exact]",
+                    "alt" => "find alt <text> [action] [value] [--exact]",
+                    "title" => "find title <text> [action] [value] [--exact]",
                     "testid" => "find testid <id> [action] [text]",
                     "first" => "find first <selector> [action] [text]",
                     "last" => "find last <selector> [action] [text]",
@@ -3060,9 +3553,13 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     }
                     Ok(cmd)
                 }
-                "text" => Ok(
-                    json!({ "id": id, "action": "getbytext", "text": value, "subaction": subaction, "exact": exact }),
-                ),
+                "text" => {
+                    let mut cmd = json!({ "id": id, "action": "getbytext", "text": value, "subaction": subaction, "exact": exact });
+                    if let Some(v) = fill_value {
+                        cmd["value"] = json!(v);
+                    }
+                    Ok(cmd)
+                }
                 "label" => {
                     let mut cmd = json!({ "id": id, "action": "getbylabel", "label": value, "subaction": subaction, "exact": exact });
                     if let Some(v) = fill_value {
@@ -3077,12 +3574,20 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     }
                     Ok(cmd)
                 }
-                "alt" => Ok(
-                    json!({ "id": id, "action": "getbyalttext", "text": value, "subaction": subaction, "exact": exact }),
-                ),
-                "title" => Ok(
-                    json!({ "id": id, "action": "getbytitle", "text": value, "subaction": subaction, "exact": exact }),
-                ),
+                "alt" => {
+                    let mut cmd = json!({ "id": id, "action": "getbyalttext", "text": value, "subaction": subaction, "exact": exact });
+                    if let Some(v) = fill_value {
+                        cmd["value"] = json!(v);
+                    }
+                    Ok(cmd)
+                }
+                "title" => {
+                    let mut cmd = json!({ "id": id, "action": "getbytitle", "text": value, "subaction": subaction, "exact": exact });
+                    if let Some(v) = fill_value {
+                        cmd["value"] = json!(v);
+                    }
+                    Ok(cmd)
+                }
                 "testid" => {
                     let mut cmd = json!({ "id": id, "action": "getbytestid", "testId": value, "subaction": subaction });
                     if let Some(v) = fill_value {
@@ -3397,7 +3902,25 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         Some("har") => {
             const HAR_VALID: &[&str] = &["start", "stop"];
             match rest.get(1).copied() {
-                Some("start") => Ok(json!({ "id": id, "action": "har_start" })),
+                Some("start") => {
+                    let mut cmd = json!({ "id": id, "action": "har_start" });
+                    if let Some(content_idx) = rest.iter().position(|&s| s == "--content") {
+                        let mode = rest.get(content_idx + 1).ok_or_else(|| {
+                            ParseError::MissingArguments {
+                                context: "network har start --content".to_string(),
+                                usage: "network har start [--content <all|text|none>]",
+                            }
+                        })?;
+                        if !["all", "text", "none"].contains(mode) {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("Invalid --content mode '{}'", mode),
+                                usage: "network har start [--content <all|text|none>]",
+                            });
+                        }
+                        cmd["content"] = json!(mode);
+                    }
+                    Ok(cmd)
+                }
                 Some("stop") => {
                     let mut cmd = json!({ "id": id, "action": "har_stop" });
                     if let Some(path) = rest.get(2) {
@@ -3533,11 +4056,24 @@ mod tests {
             user_agent: None,
             provider: None,
             ignore_https_errors: false,
+            ca_cert: None,
+            clear_ca_cert: false,
             allow_file_access: false,
             hide_scrollbars: true,
+            webgpu: false,
+            no_webmcp: false,
+            no_xvfb: false,
             device: None,
             auto_connect: false,
+            pin_tab: false,
             session_name: None,
+            restore: None,
+            restore_save: None,
+            restore_check_url: None,
+            restore_check_text: None,
+            restore_check_fn: None,
+            namespace: None,
+            restore_uses_session: false,
             cli_executable_path: false,
             cli_extensions: false,
             cli_init_scripts: false,
@@ -3548,11 +4084,16 @@ mod tests {
             cli_user_agent: false,
             cli_proxy: false,
             cli_proxy_bypass: false,
+            cli_ca_cert: false,
             cli_allow_file_access: false,
             cli_hide_scrollbars: false,
             cli_annotate: false,
             cli_download_path: false,
             cli_headed: false,
+            cli_webgpu: false,
+            cli_no_webmcp: false,
+            cli_restore: false,
+            cli_pin_tab: false,
             annotate: false,
             color_scheme: None,
             download_path: None,
@@ -3779,6 +4320,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cmd["url"], "http://localhost:3000/dashboard");
+    }
+
+    #[test]
+    fn test_a11y_command() {
+        let cmd = parse_command(&args("a11y"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "a11y");
+        assert!(cmd.get("url").is_none());
+
+        let cmd = parse_command(
+            &args("a11y http://localhost:3000 --tags wcag2a,wcag2aa --selector #main --json"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "a11y");
+        assert_eq!(cmd["url"], "http://localhost:3000");
+        assert_eq!(cmd["tags"], "wcag2a,wcag2aa");
+        assert_eq!(cmd["selector"], "#main");
+        assert_eq!(cmd["json"], true);
+
+        let cmd = parse_command(&args("a11y example.com"), &default_flags()).unwrap();
+        assert_eq!(cmd["url"], "https://example.com");
+
+        let cmd = parse_command(&args("a11y about:blank"), &default_flags()).unwrap();
+        assert_eq!(cmd["url"], "about:blank");
+
+        assert!(parse_command(&args("a11y --tags"), &default_flags()).is_err());
+        assert!(matches!(
+            parse_command(
+                &args("a11y --tags --selector #main"),
+                &default_flags()
+            ),
+            Err(ParseError::MissingArguments { context, .. }) if context == "a11y --tags"
+        ));
+        assert!(matches!(
+            parse_command(
+                &args("a11y --selector --tags wcag2a"),
+                &default_flags()
+            ),
+            Err(ParseError::MissingArguments { context, .. }) if context == "a11y --selector"
+        ));
+        assert!(parse_command(&args("a11y --bogus"), &default_flags()).is_err());
+        assert!(parse_command(
+            &args("a11y https://first.example https://second.example"),
+            &default_flags()
+        )
+        .is_err());
     }
 
     #[test]
@@ -4073,6 +4660,137 @@ mod tests {
     }
 
     #[test]
+    fn test_read_command() {
+        let cmd = parse_command(&args("read example.com/docs"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "example.com/docs");
+        assert_eq!(cmd["timeout"], crate::read::default_timeout_ms());
+    }
+
+    #[test]
+    fn test_read_without_url_uses_active_tab() {
+        let cmd = parse_command(&args("read"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert!(cmd.get("url").is_none());
+    }
+
+    #[test]
+    fn test_read_flags() {
+        let cmd = parse_command(
+            &args("read https://example.com --raw --require-md --timeout 2500"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["raw"], true);
+        assert_eq!(cmd["requireMd"], true);
+        assert_eq!(cmd["timeout"], 2500);
+    }
+
+    #[test]
+    fn test_read_includes_global_headers_and_allowed_domains() {
+        let mut flags = default_flags();
+        flags.headers = Some(r#"{"Authorization":"Bearer token","X-Trace":"abc"}"#.to_string());
+        flags.allowed_domains = Some(vec!["example.com".to_string(), "*.example.org".to_string()]);
+
+        let cmd = parse_command(&args("read https://example.com/docs"), &flags).unwrap();
+
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["headers"]["Authorization"], "Bearer token");
+        assert_eq!(cmd["headers"]["X-Trace"], "abc");
+        assert_eq!(
+            cmd["allowedDomains"],
+            json!(["example.com", "*.example.org"])
+        );
+    }
+
+    #[test]
+    fn test_read_rejects_invalid_headers_json() {
+        let mut flags = default_flags();
+        flags.headers = Some("not json".to_string());
+
+        let result = parse_command(&args("read https://example.com/docs"), &flags);
+
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_read_llms_index_filter_flags() {
+        let cmd = parse_command(
+            &args("read https://example.com/docs --llms index --filter auth"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "https://example.com/docs");
+        assert_eq!(cmd["llms"], "index");
+        assert_eq!(cmd["filter"], "auth");
+    }
+
+    #[test]
+    fn test_read_llms_full_filter_flags() {
+        let cmd = parse_command(
+            &args("read https://example.com/docs --llms full --filter auth"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "https://example.com/docs");
+        assert_eq!(cmd["llms"], "full");
+        assert_eq!(cmd["filter"], "auth");
+    }
+
+    #[test]
+    fn test_read_outline_filter_flags() {
+        let cmd = parse_command(
+            &args("read https://example.com/docs --outline --filter auth"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "https://example.com/docs");
+        assert_eq!(cmd["outline"], true);
+        assert_eq!(cmd["filter"], "auth");
+    }
+
+    #[test]
+    fn test_read_rejects_llms_with_outline() {
+        let result = parse_command(
+            &args("read https://example.com --llms index --outline"),
+            &default_flags(),
+        );
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_read_rejects_invalid_llms_mode() {
+        let result = parse_command(
+            &args("read https://example.com --llms toc"),
+            &default_flags(),
+        );
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_read_filter_without_llms_or_outline_filters_page_sections() {
+        let cmd = parse_command(
+            &args("read https://example.com --filter auth"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["filter"], "auth");
+    }
+
+    #[test]
+    fn test_read_rejects_invalid_timeout() {
+        let result = parse_command(&args("read example.com --timeout nope"), &default_flags());
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
     fn test_navigate_with_headers() {
         let mut flags = default_flags();
         flags.headers = Some(r#"{"Authorization": "Bearer token"}"#.to_string());
@@ -4210,6 +4928,26 @@ mod tests {
         assert_eq!(cmd["action"], "type");
         assert_eq!(cmd["selector"], "#input");
         assert_eq!(cmd["text"], "some text");
+    }
+
+    #[test]
+    fn test_find_fill_value_survives_for_all_locators() {
+        // fill is advertised for these locators, so the value must reach dispatch.
+        // Force-red: drop the value block from the text/alt/title arms and these
+        // assertions fail (value missing).
+        for (loc, action) in [
+            ("text", "getbytext"),
+            ("alt", "getbyalttext"),
+            ("title", "getbytitle"),
+        ] {
+            let cmd = parse_command(
+                &args(&format!("find {loc} Label fill hello")),
+                &default_flags(),
+            )
+            .unwrap();
+            assert_eq!(cmd["action"], action, "{loc}");
+            assert_eq!(cmd["value"], "hello", "{loc} dropped the fill value");
+        }
     }
 
     #[test]
@@ -4371,6 +5109,27 @@ mod tests {
     fn test_network_har_start() {
         let cmd = parse_command(&args("network har start"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "har_start");
+        assert!(cmd.get("content").is_none());
+    }
+
+    #[test]
+    fn test_network_har_start_with_content_mode() {
+        let cmd =
+            parse_command(&args("network har start --content all"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "har_start");
+        assert_eq!(cmd["content"], "all");
+    }
+
+    #[test]
+    fn test_network_har_start_rejects_invalid_content_mode() {
+        let result = parse_command(&args("network har start --content huge"), &default_flags());
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_network_har_start_content_requires_value() {
+        let result = parse_command(&args("network har start --content"), &default_flags());
+        assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
     }
 
     #[test]
@@ -4707,6 +5466,110 @@ mod tests {
         assert_eq!(cmd["path"], "output.webm");
         assert_eq!(cmd["effects"], "cursor");
         assert!(cmd.get("url").is_none());
+        // Omitting --fps lets the daemon apply its 30 fps default.
+        assert!(cmd.get("fps").is_none());
+    }
+
+    #[test]
+    fn test_record_start_with_fps() {
+        let cmd =
+            parse_command(&args("record start output.webm --fps 60"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["path"], "output.webm");
+        assert_eq!(cmd["fps"], 60);
+    }
+
+    #[test]
+    fn test_record_start_with_url_and_fps() {
+        let cmd = parse_command(
+            &args("record start demo.webm example.com --fps 24"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["path"], "demo.webm");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["fps"], 24);
+    }
+
+    #[test]
+    fn test_record_start_with_fps_before_url() {
+        let cmd = parse_command(
+            &args("record start demo.webm --fps 60 https://example.com"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["path"], "demo.webm");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["fps"], 60);
+    }
+
+    #[test]
+    fn test_record_start_rejects_fps_above_max() {
+        let result = parse_command(&args("record start demo.webm --fps 120"), &default_flags());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_rejects_zero_fps() {
+        let result = parse_command(&args("record start demo.webm --fps 0"), &default_flags());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_rejects_non_numeric_fps() {
+        let result = parse_command(&args("record start demo.webm --fps fast"), &default_flags());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_rejects_fps_without_value() {
+        let result = parse_command(&args("record start demo.webm --fps"), &default_flags());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingArguments { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_rejects_unknown_flag() {
+        let result = parse_command(&args("record start demo.webm --smooth"), &default_flags());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_rejects_extra_positional() {
+        let result = parse_command(
+            &args("record start demo.webm example.com extra"),
+            &default_flags(),
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_restart_with_fps() {
+        let cmd = parse_command(
+            &args("record restart take2.webm --fps 60"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_restart");
+        assert_eq!(cmd["path"], "take2.webm");
+        assert_eq!(cmd["fps"], 60);
     }
 
     #[test]
@@ -5588,6 +6451,90 @@ mod tests {
     fn test_stream_status() {
         let cmd = parse_command(&args("stream status"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "stream_status");
+    }
+
+    #[test]
+    fn test_webmcp_commands() {
+        let list = parse_command(&args("webmcp list"), &default_flags()).unwrap();
+        assert_eq!(list["action"], "webmcp_list");
+
+        let invoke = parse_command(
+            &args(r#"webmcp invoke search --params {"query":"agents"} --frame frame-1 --detach --timeout 5000"#),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(invoke["action"], "webmcp_invoke");
+        assert_eq!(invoke["tool"], "search");
+        assert_eq!(invoke["params"]["query"], "agents");
+        assert_eq!(invoke["frameId"], "frame-1");
+        assert_eq!(invoke["detach"], true);
+        assert_eq!(invoke["timeout"], 5000);
+
+        let result = parse_command(
+            &args("webmcp result invocation-1 --timeout 200"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(result["action"], "webmcp_result");
+        assert_eq!(result["timeout"], 200);
+
+        let cancel = parse_command(&args("webmcp cancel invocation-1"), &default_flags()).unwrap();
+        assert_eq!(cancel["action"], "webmcp_cancel");
+    }
+
+    #[test]
+    fn test_webmcp_rejects_malformed_params() {
+        let result = parse_command(
+            &args("webmcp invoke search --params not-json"),
+            &default_flags(),
+        );
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_webmcp_reads_params_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.json");
+        std::fs::write(&path, r#"{"from":"EZE","to":"LIM"}"#).unwrap();
+        let command = parse_command(
+            &[
+                "webmcp".to_string(),
+                "invoke".to_string(),
+                "search_flights".to_string(),
+                "--params".to_string(),
+                format!("@{}", path.display()),
+            ],
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(command["params"]["from"], "EZE");
+        assert_eq!(command["params"]["to"], "LIM");
+    }
+
+    #[test]
+    fn test_webmcp_rejects_non_object_params() {
+        let result = parse_command(
+            &args(r#"webmcp invoke search --params ["agents"]"#),
+            &default_flags(),
+        );
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_webmcp_rejects_unexpected_arguments() {
+        for command in [
+            "webmcp list extra",
+            "webmcp result invocation-1 extra",
+            "webmcp cancel invocation-1 extra",
+        ] {
+            assert!(
+                matches!(
+                    parse_command(&args(command), &default_flags()),
+                    Err(ParseError::InvalidValue { .. })
+                ),
+                "{command} should reject trailing arguments"
+            );
+        }
     }
 
     #[test]

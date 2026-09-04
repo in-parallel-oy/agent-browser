@@ -173,10 +173,7 @@ pub fn parse_ref(input: &str) -> Option<String> {
     None
 }
 
-/// Format the "Unknown ref" error with a hint pointing at the most recent
-/// reason `ref_map` was cleared, when one is recorded. Without the hint
-/// agents and humans see only `"Unknown ref: e1"` and have to guess
-/// whether it never existed or got wiped by a recent navigation.
+/// Format an unknown-ref error with the most recent invalidation reason when available.
 fn unknown_ref_error(ref_id: &str, ref_map: &RefMap) -> String {
     match ref_map.last_clear_reason() {
         Some(reason) => format!(
@@ -1418,6 +1415,18 @@ mod tests {
         assert!(map.get("e1").is_some());
         assert_eq!(map.get("e1").unwrap().role, "button");
         assert!(map.get("e2").is_none());
+    }
+
+    #[test]
+    fn test_ref_map_clear_resets_ref_numbering() {
+        let mut map = RefMap::new();
+        map.add("e1".to_string(), Some(42), "button", "Submit", None);
+        map.set_next_ref_num(2);
+
+        map.clear();
+
+        assert!(map.get("e1").is_none());
+        assert_eq!(map.next_ref_num(), 1);
     }
 
     #[test]

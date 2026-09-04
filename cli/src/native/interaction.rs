@@ -1016,6 +1016,7 @@ async fn dispatch_mouse_or_dialog(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_click(
     client: &CdpClient,
     session_id: &str,
