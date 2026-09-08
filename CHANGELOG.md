@@ -1,5 +1,14 @@
 # agent-browser
 
+## 0.37.0-fork.1
+
+Fork release merging upstream 0.37.0.
+
+### Bug Fixes
+
+- Fixed **recording leaking a browser context per take**. `record start` created a fresh browser context and page and never disposed them, so every take left a live page and context in Chrome for the daemon's lifetime — three takes grew a session from 5 to 12 renderer processes and kept the recorded app's sockets open. Upstream #1776 records the active page instead; the fork's effects, demo capture gate, soundtrack, `record abort`, and overlay/zoom subcommands are unchanged.
+- Fixed **Chrome surviving a daemon that was killed outright**. A SIGKILLed, crashed, or OOM-killed daemon never runs its cleanup, leaving Chrome running until reboot. Daemon startup and `close --all` now terminate browsers whose owning daemon is gone and remove their temporary profiles.
+
 ## 0.37.0
 
 <!-- release:start -->

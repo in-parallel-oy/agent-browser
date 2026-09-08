@@ -274,6 +274,10 @@ For headers on all domains:
 agent-browser set headers '{"X-Custom-Header": "value"}'
 ```
 
+## Orphaned browsers
+
+A daemon closes its browser on `close`, on idle timeout, and on shutdown. None of that runs when the daemon is killed outright — `kill -9`, a crash, or the OOM killer — and Chrome then keeps running with its renderers, memory, and open sockets until the machine reboots. Starting any session sweeps these up, as does `close --all`: a browser whose owning daemon is gone is terminated and its temporary profile removed. A browser whose daemon is still alive is never touched.
+
 ## Environment variables
 
 <table>
