@@ -772,7 +772,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_OPEN,
             "Open page",
-            "Launch the browser and optionally navigate to a URL.",
+            "Launch the browser and optionally navigate to a URL. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
@@ -854,7 +854,7 @@ fn tools() -> Vec<Value> {
             "Click an element by @ref or CSS selector.",
             json!({
                 "selector": selector_schema(),
-                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." }
+                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." }
             }),
             &["selector"],
         ),
@@ -1175,7 +1175,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_CREDENTIALS,
             "Set credentials",
-            "Set HTTP credentials.",
+            "Set HTTP credentials for the current tab and tabs opened later.",
             json!({ "username": { "type": "string" }, "password": { "type": "string" } }),
             &["username", "password"],
         ),
@@ -1280,7 +1280,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_NEW,
             "Tab new",
-            "Open a new tab.",
+            "Open a new tab after applying session setup before its first navigation.",
             json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
             &[],
         ),
@@ -1372,7 +1372,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_START,
             "Record start",
-            "Start a Chromium screencast recording. Effect-enabled recordings add click sounds and typing sounds for animated input, and scale the synthetic cursor with camera zoom. Demo mode keeps each visual action ordered with its resulting browser paint, moves the cursor to input targets, and pauses between agent/tool calls so inference delays do not create idle video.",
+            "Start a Chromium screencast recording of the current active page: no new context and no new tab, and no navigation unless url is given. Use agent_browser_tab_new beforehand to record in a separate tab. Effect-enabled recordings add click sounds and typing sounds for animated input, and scale the synthetic cursor with camera zoom. Demo mode keeps each visual action ordered with its resulting browser paint, moves the cursor to input targets, and pauses between agent/tool calls so inference delays do not create idle video.",
             recording_tool_properties(),
             &["path"],
         ),
@@ -1688,7 +1688,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_REMOVE_INIT_SCRIPT,
             "Remove init script",
-            "Remove a registered init script.",
+            "Remove a registered init script from every tab in the session.",
             json!({ "id": { "type": "string" } }),
             &["id"],
         ),
@@ -1911,8 +1911,11 @@ fn key_schema() -> Value {
 
 fn recording_tool_properties() -> Value {
     json!({
-        "path": { "type": "string" },
-        "url": { "type": "string" },
+        "path": {
+            "type": "string",
+            "description": "Output file; .webm (VP8) and .mp4 (H.264) are the supported formats, other extensions are handed to ffmpeg as-is with H.264 video. Must have an extension. Needs ffmpeg on PATH.",
+        },
+        "url": { "type": "string", "description": "Navigate the active tab to this URL before recording starts." },
         "fps": {
             "type": "integer",
             "minimum": 1,
@@ -4311,6 +4314,9 @@ mod tests {
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_OPEN))
             .unwrap();
+        assert!(open["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("WebMCP availability metadata")));
         let props = &open["inputSchema"]["properties"];
         assert!(props.get("headed").is_some());
         assert!(props.get("webgpu").is_some());
@@ -4933,6 +4939,21 @@ mod tests {
             assert_eq!(fps["minimum"], json!(1));
             // Must stay in sync with the CLI parser's --fps ceiling.
             assert_eq!(fps["maximum"], json!(crate::native::recording::MAX_FPS));
+
+            // The parser requires an extension and the two tuned formats are
+            // the ones to steer callers toward.
+            let path_desc = tool["inputSchema"]["properties"]["path"]["description"]
+                .as_str()
+                .unwrap();
+            for needle in [".webm", ".mp4", "ffmpeg"] {
+                assert!(
+                    path_desc.contains(needle),
+                    "{} path description should mention {}: {}",
+                    name,
+                    needle,
+                    path_desc
+                );
+            }
         }
 
         assert_eq!(

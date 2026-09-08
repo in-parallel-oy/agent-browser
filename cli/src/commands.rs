@@ -1673,11 +1673,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             const VALID: &[&str] = &["start", "stop", "abort", "restart", "overlay", "zoom"];
             match rest.first().copied() {
                 Some("start") => {
+                    const USAGE: &str = "record start <output.webm|output.mp4> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]";
                     let parsed = split_record_args(&rest[1..], "record start")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record start".to_string(),
-                        usage: "record start <output.webm> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: USAGE,
                     })?;
+                    // ffmpeg picks the container from the extension and only
+                    // fails at `record stop`, so reject an extensionless path
+                    // before the daemon is asked.
+                    crate::native::recording::validate_output_path(path)
+                        .map_err(|message| ParseError::InvalidValue { message, usage: USAGE })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
                     if let Some(u) = url {
@@ -1715,11 +1721,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     Ok(json!({ "id": id, "action": "recording_abort" }))
                 }
                 Some("restart") => {
+                    const USAGE: &str = "record restart <output.webm|output.mp4> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]";
                     let parsed = split_record_args(&rest[1..], "record restart")?;
                     let path = parsed.positional.first().ok_or_else(|| ParseError::MissingArguments {
                         context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url] [--fps <n>] [--record-effects <cursor|demo|off>] [--cursor <arrow|dot|hand> | --no-cursor] [--cursor-tween-ms <n>] [--cursor-click-ms <n>] [--cursor-size <n>] [--cursor-motion <auto|always|off>] [--cursor-block-clicks]",
+                        usage: USAGE,
                     })?;
+                    // ffmpeg picks the container from the extension and only
+                    // fails at `record stop`, so reject an extensionless path
+                    // before the daemon is asked.
+                    crate::native::recording::validate_output_path(path)
+                        .map_err(|message| ParseError::InvalidValue { message, usage: USAGE })?;
                     let url = parsed.positional.get(1);
                     let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
                     if let Some(u) = url {
@@ -5522,6 +5534,69 @@ mod tests {
     }
 
     #[test]
+    fn test_record_start_accepts_any_extension() {
+        // .webm and .mp4 are the documented formats; other containers
+        // worked before validation existed and are still passed through.
+        for path in [
+            "demo.mp4",
+            "./out/DEMO.WEBM",
+            "Take.Mp4",
+            "take.mkv",
+            "take.mov",
+            "dir.v2/take.MP4",
+        ] {
+            let cmd = parse_command(&args(&format!("record start {}", path)), &default_flags())
+                .unwrap_or_else(|e| panic!("{} should parse: {:?}", path, e));
+            assert_eq!(cmd["action"], "recording_start");
+            assert_eq!(cmd["path"], path);
+        }
+    }
+
+    #[test]
+    fn test_record_start_rejects_extensionless_path() {
+        for path in ["take", "dir.v2/take", ".hidden"] {
+            let err = parse_command(&args(&format!("record start {}", path)), &default_flags())
+                .unwrap_err();
+            match err {
+                ParseError::InvalidValue { message, usage } => {
+                    assert!(message.contains(path), "should name the path: {}", message);
+                    assert!(message.contains("no extension"), "message was: {}", message);
+                    assert!(
+                        message.contains(".webm"),
+                        "should suggest .webm: {}",
+                        message
+                    );
+                    assert!(message.contains(".mp4"), "should suggest .mp4: {}", message);
+                    assert!(usage.starts_with("record start"), "usage was: {}", usage);
+                }
+                other => panic!("expected InvalidValue for {}, got {:?}", path, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_record_start_rejects_extensionless_path_with_valid_fps() {
+        // The path is validated once all flags are parsed, so a bad path
+        // is reported even when --fps is fine.
+        let err = parse_command(&args("record start take --fps 60"), &default_flags()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidValue { ref message, .. } if message.contains("output path"))
+        );
+    }
+
+    #[test]
+    fn test_record_restart_rejects_extensionless_path() {
+        let err = parse_command(&args("record restart take2"), &default_flags()).unwrap_err();
+        match err {
+            ParseError::InvalidValue { message, usage } => {
+                assert!(message.contains("take2"), "message was: {}", message);
+                assert!(usage.starts_with("record restart"), "usage was: {}", usage);
+            }
+            other => panic!("expected InvalidValue, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_record_start_rejects_non_numeric_fps() {
         let result = parse_command(&args("record start demo.webm --fps fast"), &default_flags());
         assert!(matches!(
@@ -5542,10 +5617,12 @@ mod tests {
     #[test]
     fn test_record_start_rejects_unknown_flag() {
         let result = parse_command(&args("record start demo.webm --smooth"), &default_flags());
-        assert!(matches!(
-            result.unwrap_err(),
-            ParseError::InvalidValue { .. }
-        ));
+        match result.unwrap_err() {
+            ParseError::InvalidValue { message, .. } => {
+                assert!(message.contains("--smooth"), "got: {message}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

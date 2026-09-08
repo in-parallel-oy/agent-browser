@@ -197,6 +197,18 @@ fn format_webmcp_tool_text(tool: &serde_json::Value) -> String {
     format!("{} [{}]\n  {}\n  {}", name, frame, description, origin)
 }
 
+fn format_webmcp_availability_text(data: &serde_json::Value) -> Option<&'static str> {
+    let webmcp = data.get("webmcp")?;
+    (webmcp.get("available").and_then(|value| value.as_bool()) == Some(true)
+        && webmcp
+            .get("toolCount")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|count| count > 0))
+    .then_some(
+        "WebMCP tools are available on this page (experimental)\nRun `agent-browser webmcp list` to view them",
+    )
+}
+
 fn confirmation_data(data: &serde_json::Value) -> Option<&serde_json::Value> {
     if data
         .get("confirmation_required")
@@ -579,9 +591,15 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             if let Some(title) = data.get("title").and_then(|v| v.as_str()) {
                 println!("{} {}", color::success_indicator(), color::bold(title));
                 println!("  {}", color::dim(url));
+                if let Some(webmcp) = format_webmcp_availability_text(data) {
+                    println!("{}", webmcp);
+                }
                 return;
             }
             println!("{}", url);
+            if let Some(webmcp) = format_webmcp_availability_text(data) {
+                println!("{}", webmcp);
+            }
             return;
         }
         if let Some(cdp_url) = data.get("cdpUrl").and_then(|v| v.as_str()) {
@@ -1499,7 +1517,8 @@ real navigation — useful for SSR debug, auth setup, and capturing fresh
 `react suspense` / `vitals` state without noise from a prior page.
 
 With a URL, launches and navigates. If no protocol is provided, https://
-is automatically prepended.
+is automatically prepended. When the page registers WebMCP tools, successful
+navigation output tells you to run `agent-browser webmcp list`.
 
 The `goto` and `navigate` aliases still require a URL.
 
@@ -1635,8 +1654,9 @@ If another element covers the click point, agent-browser reports the
 covering element instead of dispatching a click to the wrong target.
 
 Options:
-  --new-tab            Open link in a new tab instead of navigating current tab
-                       (only works on elements with href attribute)
+  --new-tab            Open link in a new tab instead of navigating current tab.
+                       The new tab inherits session setup before its first load.
+                       Only works on elements with an href attribute.
 
 Global Options:
   --json               Output as JSON
@@ -2367,9 +2387,9 @@ Settings:
   viewport <w> <h> [scale]   Set viewport size (scale = deviceScaleFactor, e.g. 2 for retina)
   device <name>              Emulate device (e.g., "iPhone 12")
   geo <lat> <lng>            Set geolocation
-  offline [on|off]           Toggle offline mode
-  headers <json>             Set extra HTTP headers
-  credentials <user> <pass>  Set HTTP authentication
+  offline [on|off]           Toggle offline mode; off restores the new-tab default
+  headers <json>             Set extra HTTP headers; use {} to clear them for new tabs
+  credentials <user> <pass>  Set HTTP authentication for current and future tabs
   media [dark|light]         Set color scheme preference
         [reduced-motion]     Enable reduced motion
 
@@ -2532,6 +2552,10 @@ referring to the same tab across commands. Optional user-assigned labels
 (e.g. `docs`, `app`) are interchangeable with ids everywhere a tab ref is
 accepted. CDP target ids (from `tab list --json`) are also accepted as tab
 refs; unlike `t<N>` ids they stay stable across daemon restarts.
+
+Tabs opened with `tab new` or `click --new-tab` inherit the session's user
+agent, headers, HTTP credentials, init scripts, routes, and emulation
+overrides before their first document loads.
 
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, commands fail with a
@@ -2781,26 +2805,34 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url] [--fps <n>] [effect flags]
+Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>] [effect flags]
        agent-browser record stop
        agent-browser record abort
-       agent-browser record restart <path.webm> [url] [--fps <n>] [effect flags]
+       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>] [effect flags]
        agent-browser record overlay text <text> [--position <top|center|bottom>] [--duration-ms <n>]
        agent-browser record overlay spotlight <selector|ref>|--x <n> --y <n> [--radius <n>] [--duration-ms <n>]
        agent-browser record overlay clear
        agent-browser record zoom to <selector|ref>|--x <n> --y <n> [--scale <n>] [--duration-ms <n>]
        agent-browser record zoom reset
 
-Record the browser to a WebM video file.
-Creates a fresh browser context and copies cookies from the active session.
-If no URL is provided, it automatically navigates to the current page.
+Record the browser to a video file. Supported formats are .webm (VP8 via
+libvpx) and .mp4 (H.264 via libx264); any other extension is handed to
+ffmpeg as-is with H.264 video. A path with no extension is rejected.
+Records the current active page as-is: no new context, no new tab, and no
+navigation unless you pass a URL. Capture starts on the page you already
+have open, so hydration and initial animations are not re-run cold.
+If a URL is provided, the active tab navigates there first.
+To record in a separate tab, run `tab new [url]` before `record start`.
+
+Requires ffmpeg on PATH with the libvpx and libx264 encoders (brew install
+ffmpeg, or apt install ffmpeg). Run `agent-browser doctor` to check.
 
 Recording captures 30 fps, which keeps scrolls and CSS transitions smooth.
 Raise it to 60 for short, motion-heavy takes (drag interactions, animation
 work); lower it for long sessions where file size matters more than motion.
 
 Operations:
-  start <path> [url]     Start recording (defaults to current URL if omitted)
+  start <path> [url]     Start recording the active page (navigates first if url given)
   stop                   Stop recording and save video
   abort                  Stop recording and discard the partial video
   restart <path> [url]   Stop current recording (if any) and start a new one
@@ -2857,15 +2889,19 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  # Record from current page (preserves login state, cursor included)
+  # Record the page you are on (keeps login state; cursor included)
   agent-browser open https://app.example.com/dashboard
   agent-browser snapshot -i            # Explore and plan
   agent-browser record start ./demo.webm
   agent-browser click @e3              # Execute planned actions
   agent-browser record stop
 
-  # Specify URL
+  # Navigate the active tab, then record
   agent-browser record start ./demo.webm https://example.com
+
+  # Record in a separate tab
+  agent-browser tab new https://example.com
+  agent-browser record start ./demo.webm
 
   # 60 fps for a scroll or animation capture
   agent-browser record start ./scroll.webm --fps 60
@@ -3788,7 +3824,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM, 30 fps; --fps 1-60)
+  record start <path> [url]  Start video recording (.webm/.mp4; --fps 1-60; needs ffmpeg)
                              Browser-rendered cursor is on by default
   record stop                Stop and save video
   console [--clear]          View console logs
@@ -3808,6 +3844,7 @@ WebMCP (experimental):
                              --frame <frame-id>, --detach, and --timeout <ms>
   webmcp result <id>         Wait for a detached invocation result
   webmcp cancel <id>         Cancel an active invocation
+  Successful navigation advertises when the page has WebMCP tools
 
 React (requires `open --enable react-devtools`):
   react tree                 Full React component tree (depth id parent name columns)
@@ -3834,7 +3871,7 @@ SPA:
                              history.pushState + popstate/navigate events for other frameworks
 
 Init scripts:
-  removeinitscript <id>      Remove a script registered via --init-script or addinitscript
+  removeinitscript <id>      Remove a registered script from every tab in the session
 
 Batch:
   batch [--bail] ["cmd" ...]  Execute multiple commands sequentially (args or stdin)
@@ -4196,7 +4233,8 @@ pub fn print_version() {
 mod tests {
     use super::{
         boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
-        format_webmcp_text, format_webmcp_tool_text, format_with_boundaries, OutputOptions,
+        format_webmcp_availability_text, format_webmcp_text, format_webmcp_tool_text,
+        format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
@@ -4501,5 +4539,49 @@ hydration: -  phases: 0  hydratedComponents: 0"
         assert!(!first.contains("origin=https://b.example"));
         assert!(second.contains("origin=https://b.example"));
         assert!(!second.contains("origin=https://a.example"));
+    }
+
+    #[test]
+    fn test_navigation_formats_webmcp_availability_hint() {
+        let data = json!({
+            "url": "https://example.com",
+            "webmcp": {
+                "experimental": true,
+                "available": true,
+                "toolCount": 4
+            }
+        });
+
+        assert_eq!(
+            format_webmcp_availability_text(&data),
+            Some(
+                "WebMCP tools are available on this page (experimental)\nRun `agent-browser webmcp list` to view them"
+            )
+        );
+    }
+
+    #[test]
+    fn test_navigation_omits_webmcp_hint_without_available_tools() {
+        for data in [
+            json!({"url": "https://example.com"}),
+            json!({
+                "url": "https://example.com",
+                "webmcp": {
+                    "experimental": true,
+                    "available": false,
+                    "toolCount": 4
+                }
+            }),
+            json!({
+                "url": "https://example.com",
+                "webmcp": {
+                    "experimental": true,
+                    "available": true,
+                    "toolCount": 0
+                }
+            }),
+        ] {
+            assert_eq!(format_webmcp_availability_text(&data), None);
+        }
     }
 }
