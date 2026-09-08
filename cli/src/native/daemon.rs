@@ -66,6 +66,9 @@ pub async fn run_daemon(session: &str) {
     let pid_path = socket_dir.join(format!("{}.pid", session));
     let _ = fs::write(&pid_path, process::id().to_string());
 
+    // Sweep Chrome left running by a daemon that died without cleaning up.
+    super::cdp::chrome::reap_orphaned_chrome();
+
     let version_path = socket_dir.join(format!("{}.version", session));
     let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
 

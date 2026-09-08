@@ -902,6 +902,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         Some(pid)
     };
 
+    #[cfg(unix)]
+    if let (Some(dir), Some(pgid)) = (temp_user_data_dir.as_ref(), pgid) {
+        // Written last, so a dir still being launched into is never reaped.
+        let _ = std::fs::write(
+            dir.join(OWNER_MARKER),
+            format!("{} {}", std::process::id(), pgid),
+        );
+    }
+
     Ok(ChromeProcess {
         child,
         ws_url,
@@ -913,6 +922,55 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         xvfb,
     })
 }
+
+/// Names the daemon that owns the Chrome in a temp user-data-dir, and
+/// Chrome's process group: "<daemon pid> <chrome pgid>".
+const OWNER_MARKER: &str = "agent-browser-owner";
+
+/// Kill Chrome left behind by a daemon that died without running
+/// [`ChromeProcess::drop`] — SIGKILL, a crash, or an OOM kill. Nothing else
+/// reaps those: they keep their renderers, their memory and their sockets
+/// until the machine reboots. Called on daemon startup and by `close --all`.
+#[cfg(unix)]
+pub fn reap_orphaned_chrome() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let is_ours = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("agent-browser-chrome-"));
+        if !is_ours {
+            continue;
+        }
+        let Ok(marker) = std::fs::read_to_string(dir.join(OWNER_MARKER)) else {
+            continue;
+        };
+        let mut fields = marker.split_whitespace();
+        let owner = fields.next().and_then(|v| v.parse::<i32>().ok());
+        let pgid = fields.next().and_then(|v| v.parse::<i32>().ok());
+        let (Some(owner), Some(pgid)) = (owner, pgid) else {
+            continue;
+        };
+        // The owning daemon is still up: leave its browser alone.
+        if unsafe { libc::kill(owner, 0) } == 0 {
+            continue;
+        }
+        // Chrome is its own process group leader. A recycled pid that leads no
+        // group is not the Chrome we launched, so it is never signalled.
+        if pgid > 0 && unsafe { libc::getpgid(pgid) } == pgid {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn reap_orphaned_chrome() {}
 
 fn wait_for_devtools_active_port(
     child: &mut Child,
@@ -1732,6 +1790,56 @@ fn expand_tilde(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn reap_orphaned_chrome_removes_dead_owners_and_keeps_live_ones() {
+        use super::{reap_orphaned_chrome, OWNER_MARKER};
+
+        // pgid 0 so the test never signals a process group; only the
+        // owner-liveness branch and the directory cleanup are exercised.
+        let make = |owner: i32| {
+            let dir = std::env::temp_dir().join(format!(
+                "agent-browser-chrome-reap-test-{}-{}",
+                std::process::id(),
+                owner
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(OWNER_MARKER), format!("{} 0", owner)).unwrap();
+            dir
+        };
+
+        // A pid that cannot be running: pid 0 is the swapper/kernel, and
+        // kill(0, 0) signals our own process group, so use an unused high pid.
+        let mut dead_pid = 0;
+        for candidate in (100_000..200_000).rev() {
+            if unsafe { libc::kill(candidate, 0) } != 0 {
+                dead_pid = candidate;
+                break;
+            }
+        }
+        assert!(dead_pid > 0, "no free pid to stand in for a dead daemon");
+
+        let orphan = make(dead_pid);
+        let owned = make(std::process::id() as i32);
+        let unmarked = std::env::temp_dir().join(format!(
+            "agent-browser-chrome-reap-test-unmarked-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&unmarked).unwrap();
+
+        reap_orphaned_chrome();
+
+        assert!(!orphan.exists(), "a dead owner's profile must be removed");
+        assert!(owned.exists(), "a live owner's profile must be left alone");
+        assert!(
+            unmarked.exists(),
+            "a launch still in flight has no marker and must be left alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&owned);
+        let _ = std::fs::remove_dir_all(&unmarked);
+    }
+
     use super::*;
     use crate::test_utils::EnvGuard;
 

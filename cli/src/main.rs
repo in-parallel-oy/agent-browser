@@ -1241,6 +1241,10 @@ fn run_dashboard_stop(json_mode: bool) {
 }
 
 fn run_close_all(flags: &Flags) {
+    // Chrome outlives a daemon that was SIGKILLed, so sweep those first:
+    // walk_daemons only knows about sidecar files, not the browsers behind them.
+    native::cdp::chrome::reap_orphaned_chrome();
+
     // walk_daemons auto-cleans stale .pid / .sock / .stream sidecar files and
     // separates out the standalone dashboard. We only want to send `close` to
     // real session daemons; the dashboard has its own `dashboard stop`.
