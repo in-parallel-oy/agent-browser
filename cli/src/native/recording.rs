@@ -1784,17 +1784,22 @@ mod tests {
         let (pipe, _unread) = tokio::io::duplex(1);
         let writer = tokio::spawn(write_frames(runs, pipe));
 
-        for _ in 0..encoder_backlog_slots(DEFAULT_FPS) {
-            queue
-                .send((frame(b"jpeg"), 1))
-                .now_or_never()
-                .expect("capture should queue while the encoder is stalled")
-                .unwrap();
-        }
-        assert!(
-            queue.send((frame(b"jpeg"), 1)).now_or_never().is_none(),
-            "a full backlog makes capture wait"
-        );
+        // Unconstrained: 150 back-to-back polls would otherwise exhaust tokio's
+        // cooperative budget and read as a wait that has nothing to do with slots.
+        tokio::task::unconstrained(async {
+            for _ in 0..encoder_backlog_slots(DEFAULT_FPS) {
+                queue
+                    .send((frame(b"jpeg"), 1))
+                    .now_or_never()
+                    .expect("capture should queue while the encoder is stalled")
+                    .unwrap();
+            }
+            assert!(
+                queue.send((frame(b"jpeg"), 1)).now_or_never().is_none(),
+                "a full backlog makes capture wait"
+            );
+        })
+        .await;
         writer.abort();
     }
 
