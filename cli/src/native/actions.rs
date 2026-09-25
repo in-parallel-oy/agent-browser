@@ -7735,7 +7735,8 @@ async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String>
 
 async fn handle_recording_abort(state: &mut DaemonState) -> Result<Value, String> {
     let output_path = state.recording_state.output_path.clone();
-    let task_result = state.stop_recording_task().await;
+    // No post-roll or drain: the file is deleted below.
+    let task_result = recording::discard_recording_task(&mut state.recording_state).await;
     let result = recording::recording_abort(&mut state.recording_state);
     let clear_result = clear_recording_effects(state).await;
 

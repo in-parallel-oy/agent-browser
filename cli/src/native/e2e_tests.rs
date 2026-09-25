@@ -7487,6 +7487,126 @@ async fn e2e_recording_honors_requested_fps() {
     assert_success(&resp);
 }
 
+/// Verify that capture keeps acknowledging screencast frames while the
+/// encoder is not reading. Chrome sends no new frame until the previous ones
+/// are acknowledged, so a capture loop that waited on a stalled encoder would
+/// receive one or two frames of an animating page for the whole stall. Also
+/// verify that a discarded take ends promptly behind an encoder that never
+/// reads.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_capture_continues_while_encoder_stalls() {
+    use super::recording;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const FPS: u32 = 30;
+    const STALL_SECS: u64 = 4;
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": "data:text/html,<p id=n></p><script>let i=0;(function f(){n.textContent=i++;requestAnimationFrame(f)})()</script>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let mgr = state.browser.as_ref().unwrap();
+    let client = mgr.client.clone();
+    let session_id = mgr.active_session_id().unwrap().to_string();
+    let capture_session = recording::attach_capture_session(
+        &client,
+        &session_id,
+        &state.recording_state.capture_session,
+    )
+    .await
+    .unwrap();
+
+    // Stands in for ffmpeg: reads nothing for STALL_SECS, then everything.
+    let encoder = tokio::process::Command::new("sh")
+        .args(["-c", &format!("sleep {STALL_SECS}; cat >/dev/null")])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let captured = Arc::new(AtomicU64::new(0));
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let task = recording::spawn_recording_task(
+        client,
+        capture_session,
+        encoder,
+        FPS,
+        Arc::new(AtomicU64::new(0)),
+        captured.clone(),
+        cancel_rx,
+        None,
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let before = captured.load(Ordering::Relaxed);
+    tokio::time::sleep(tokio::time::Duration::from_secs(STALL_SECS - 1)).await;
+    let during_stall = captured.load(Ordering::Relaxed) - before;
+    assert!(
+        during_stall >= FPS as u64,
+        "capture should keep receiving frames while the encoder stalls, got {during_stall} in {}s",
+        STALL_SECS - 1
+    );
+
+    let _ = cancel_tx.send(false);
+    task.await.unwrap().unwrap();
+    *state.recording_state.capture_session.lock().unwrap() = None;
+
+    // An encoder that never reads fills the backlog and leaves capture
+    // waiting for room. Discarding the take must still end it at once.
+    let mgr = state.browser.as_ref().unwrap();
+    let client = mgr.client.clone();
+    let capture_session = recording::attach_capture_session(
+        &client,
+        &session_id,
+        &state.recording_state.capture_session,
+    )
+    .await
+    .unwrap();
+    let wedged = tokio::process::Command::new("sh")
+        .args(["-c", "exec sleep 60"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let task = recording::spawn_recording_task(
+        client,
+        capture_session,
+        wedged,
+        FPS,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        cancel_rx,
+        None,
+    );
+    // Past the five-second backlog.
+    tokio::time::sleep(tokio::time::Duration::from_secs(7)).await;
+    let _ = cancel_tx.send(true);
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), task)
+        .await
+        .expect("discarding must not wait for a wedged encoder")
+        .unwrap()
+        .unwrap();
+    *state.recording_state.capture_session.lock().unwrap() = None;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 /// Verify that browser-rendered interaction effects follow camera zoom as a
 /// single visual system. The cursor tip and click center remain anchored to
 /// the same content point, both effects scale with the page, and a short

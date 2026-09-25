@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{AttachToTargetParams, AttachToTargetResult};
@@ -52,6 +52,11 @@ const MAX_PENDING_FRAMES: usize = 2;
 /// bounds the queue's memory and how long `record stop` spends draining it.
 const MAX_ENCODER_BACKLOG_SECS: u64 = 5;
 
+/// Longest `record stop` waits for the encoder to drain its queue: a full
+/// backlog at a third of real-time speed, inside the CLI's 30 s response
+/// budget. Past it ffmpeg is taken to have stopped reading and is killed.
+const ENCODER_DRAIN_LIMIT: Duration = Duration::from_secs(3 * MAX_ENCODER_BACKLOG_SECS);
+
 /// JPEG quality requested from `Page.startScreencast`. Matches the quality the
 /// recorder used to request from `Page.captureScreenshot`.
 const SCREENCAST_QUALITY: u32 = 80;
@@ -74,6 +79,9 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A frame queued for the encoder and the number of consecutive slots it
 /// fills.
 type SlotRun = (Arc<[u8]>, u64);
+
+/// A [`SlotRun`] with its share of the encoder backlog, returned once written.
+type QueuedRun = (SlotRun, OwnedSemaphorePermit);
 
 #[derive(Clone, Copy, Debug)]
 enum RecordedSound {
@@ -192,10 +200,48 @@ fn frames_due(elapsed: Duration, period: Duration, written: u64) -> u64 {
     slot.saturating_add(1).saturating_sub(written)
 }
 
-/// Encoder queue length at `fps`, in entries. An entry fills at least one
-/// slot, so a full queue holds at least [`MAX_ENCODER_BACKLOG_SECS`] of video.
-fn encoder_backlog_frames(fps: u32) -> usize {
-    (MAX_ENCODER_BACKLOG_SECS * fps.clamp(1, MAX_FPS) as u64) as usize
+/// Encoder queue length at `fps`, in slots: [`MAX_ENCODER_BACKLOG_SECS`] of
+/// video.
+fn encoder_backlog_slots(fps: u32) -> u32 {
+    MAX_ENCODER_BACKLOG_SECS as u32 * fps.clamp(1, MAX_FPS)
+}
+
+/// Capture's end of the encoder queue. The bound is in slots, not entries:
+/// a frame held through a gap is one entry, but ffmpeg encodes it once per
+/// slot, so an entry bound would let a slow encoder fall minutes behind.
+struct EncoderQueue {
+    runs: mpsc::UnboundedSender<QueuedRun>,
+    slots: Arc<Semaphore>,
+    capacity: u32,
+}
+
+impl EncoderQueue {
+    fn new(fps: u32) -> (Self, mpsc::UnboundedReceiver<QueuedRun>) {
+        let capacity = encoder_backlog_slots(fps);
+        let (runs, rx) = mpsc::unbounded_channel();
+        let queue = Self {
+            runs,
+            slots: Arc::new(Semaphore::new(capacity as usize)),
+            capacity,
+        };
+        (queue, rx)
+    }
+
+    /// Queue `run` once the backlog has room for it. A run longer than the
+    /// whole backlog waits for an empty queue. Fails once the writer is gone.
+    async fn send(&self, run: SlotRun) -> Result<(), ()> {
+        let wanted = run.1.min(self.capacity as u64) as u32;
+        let permit = Arc::clone(&self.slots)
+            .acquire_many_owned(wanted)
+            .await
+            .map_err(|_| ())?;
+        self.runs.send((run, permit)).map_err(|_| ())
+    }
+
+    /// Slots queued or being written.
+    fn queued_slots(&self) -> u32 {
+        self.capacity - self.slots.available_permits() as u32
+    }
 }
 
 /// Split the `emit` slots owed on one tick into encoder queue entries.
@@ -261,7 +307,8 @@ pub struct RecordingState {
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub shared_captured_count: Option<Arc<AtomicU64>>,
-    pub cancel_tx: Option<oneshot::Sender<()>>,
+    /// Ends capture; `true` discards the take instead of finishing the file.
+    pub cancel_tx: Option<oneshot::Sender<bool>>,
     /// Extra capture time requested when stopping a demo recording.
     pub stop_post_roll: Duration,
     /// Activity gate used by demo mode to omit time between visual actions.
@@ -612,6 +659,8 @@ fn spawn_ffmpeg_command(
 /// wall-clock ticker queues one frame per slot, holding the last one through
 /// gaps, so the file's duration matches the automation it recorded. A second
 /// task drains the queue into ffmpeg, so encoding never delays capture.
+/// Sending `true` on `cancel_rx` discards the take: ffmpeg is killed instead
+/// of drained.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
@@ -620,7 +669,7 @@ pub fn spawn_recording_task(
     fps: u32,
     shared_count: Arc<AtomicU64>,
     shared_captured: Arc<AtomicU64>,
-    cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: oneshot::Receiver<bool>,
     capture_gate: Option<Arc<RecordingCaptureGate>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
@@ -637,8 +686,8 @@ pub fn spawn_recording_task(
             .stdin
             .take()
             .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
-        let (frames_tx, frames_rx) = mpsc::channel(encoder_backlog_frames(fps));
-        let writer = tokio::spawn(write_frames(frames_rx, stdin));
+        let (queue, runs) = EncoderQueue::new(fps);
+        let writer = tokio::spawn(write_frames(runs, stdin));
 
         let started = client
             .send_command(
@@ -661,7 +710,7 @@ pub fn spawn_recording_task(
                     &client,
                     &capture_session,
                     events,
-                    frames_tx,
+                    queue,
                     period,
                     max_frames_per_tick,
                     &shared_count,
@@ -672,7 +721,7 @@ pub fn spawn_recording_task(
                 .await
             }
             Err(e) => {
-                drop(frames_tx);
+                drop(queue);
                 Err(format!("Failed to start screencast: {}", e))
             }
         };
@@ -688,15 +737,36 @@ pub fn spawn_recording_task(
         detach_capture_session(&client, &capture_session).await;
 
         // ffmpeg sees EOF once the writer has drained what capture queued.
-        let _ = writer.await;
+        // A discarded take is not worth draining, and an encoder that has
+        // stopped reading would hold `record stop` forever.
+        let discard = matches!(capture, Ok(true));
+        let drain_started = tokio::time::Instant::now();
+        let drained = if discard {
+            writer.abort();
+            let _ = writer.await;
+            Ok(())
+        } else {
+            drain_encoder(writer, ENCODER_DRAIN_LIMIT).await
+        };
+        if discard || drained.is_err() {
+            let _ = ffmpeg.start_kill();
+        }
+        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[recording] encoder drained in {:?}",
+                drain_started.elapsed()
+            );
+        }
         let output = ffmpeg
             .wait_with_output()
             .await
             .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
 
         capture?;
+        drained?;
 
-        if !output.status.success() {
+        if !discard && !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("ffmpeg failed: {}", ffmpeg_error_tail(&stderr)));
         }
@@ -707,20 +777,21 @@ pub fn spawn_recording_task(
 
 /// Pump screencast frames into the encoder queue until cancelled, the page
 /// goes away, or the encoder hangs up. Takes ownership of `frames` so the
-/// writer sees the end of the queue on return.
+/// writer sees the end of the queue on return. Returns whether the take is
+/// being discarded.
 #[allow(clippy::too_many_arguments)]
 async fn capture_frames(
     client: &CdpClient,
     capture_session: &str,
     mut events: mpsc::Receiver<super::cdp::types::CdpEvent>,
-    frames: mpsc::Sender<SlotRun>,
+    frames: EncoderQueue,
     period: Duration,
     max_frames_per_tick: u64,
     shared_count: &AtomicU64,
     shared_captured: &AtomicU64,
-    cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: oneshot::Receiver<bool>,
     capture_gate: Option<&RecordingCaptureGate>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut cancel_rx = std::pin::pin!(cancel_rx);
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -734,10 +805,15 @@ async fn capture_frames(
     let mut last: Option<Arc<[u8]>> = None;
     let mut segment_started: Option<tokio::time::Instant> = None;
     let mut segment_written: u64 = 0;
+    let mut discard = false;
+    let mut peak_backlog = 0;
 
     loop {
         tokio::select! {
-            _ = &mut cancel_rx => break,
+            cancel = &mut cancel_rx => {
+                discard = cancel.unwrap_or(false);
+                break;
+            }
             event = events.recv() => {
                 let Some(event) = event else { break };
                 if event.method == "Page.screencastFrame" {
@@ -793,40 +869,79 @@ async fn capture_frames(
                 // the file. Advancing `written` by the full amount is what
                 // stops the excess being paid off on later ticks.
                 let emit = due.min(max_frames_per_tick);
-                let mut encoder_gone = false;
+                // A stop must be heard while capture waits for room in the
+                // backlog, or an encoder that stopped reading would hang it.
+                let mut ended = None;
                 for run in fill_slots(&mut pending, &mut last, emit) {
-                    if frames.send(run).await.is_err() {
-                        encoder_gone = true;
-                        break;
+                    let slots = run.1;
+                    tokio::select! {
+                        sent = frames.send(run) => {
+                            if sent.is_err() {
+                                ended = Some(false);
+                                break;
+                            }
+                        }
+                        cancel = &mut cancel_rx => {
+                            ended = Some(cancel.unwrap_or(false));
+                            break;
+                        }
                     }
+                    shared_count.fetch_add(slots, Ordering::Relaxed);
+                    peak_backlog = peak_backlog.max(frames.queued_slots());
                 }
-                if encoder_gone {
+                if let Some(end) = ended {
+                    discard = end;
                     break;
                 }
                 segment_written += due;
-                shared_count.fetch_add(emit, Ordering::Relaxed);
             }
         }
     }
 
+    if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[recording] encoder backlog peaked at {} of {} slots",
+            peak_backlog,
+            frames.capacity
+        );
+    }
     drop(frames);
-    Ok(())
+    Ok(discard)
 }
 
 /// Write queued frames to ffmpeg until capture closes the queue or the pipe
 /// breaks. Returning drops the queue, which is how a dead encoder ends
 /// capture, and drops `stdin`, which is ffmpeg's EOF.
-async fn write_frames<W>(mut frames: mpsc::Receiver<SlotRun>, mut stdin: W)
+async fn write_frames<W>(mut runs: mpsc::UnboundedReceiver<QueuedRun>, mut stdin: W)
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    while let Some((frame, slots)) = frames.recv().await {
+    // The permit returns the run's slots to the backlog once it is written.
+    while let Some(((frame, slots), _permit)) = runs.recv().await {
         for _ in 0..slots {
             if stdin.write_all(&frame).await.is_err() {
                 return;
             }
         }
     }
+}
+
+/// Wait up to `limit` for the writer to finish, aborting it past that. Only
+/// an encoder that has stopped reading its input takes that long.
+async fn drain_encoder(
+    mut writer: tokio::task::JoinHandle<()>,
+    limit: Duration,
+) -> Result<(), String> {
+    if tokio::time::timeout(limit, &mut writer).await.is_ok() {
+        return Ok(());
+    }
+    writer.abort();
+    let _ = writer.await;
+    Err(format!(
+        "ffmpeg did not finish encoding the recording within {:?}",
+        limit
+    ))
 }
 
 /// Add recorded interaction sounds to a completed Chromium screencast. The
@@ -1114,8 +1229,18 @@ fn looped_keyboard_sample(sample: u64) -> f32 {
 }
 
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
+    end_recording_task(state, false).await
+}
+
+/// Stop the capture task of a take that is being thrown away, killing the
+/// encoder instead of waiting for it to finish the file.
+pub async fn discard_recording_task(state: &mut RecordingState) -> Result<(), String> {
+    end_recording_task(state, true).await
+}
+
+async fn end_recording_task(state: &mut RecordingState, discard: bool) -> Result<(), String> {
     if let Some(tx) = state.cancel_tx.take() {
-        let _ = tx.send(());
+        let _ = tx.send(discard);
     }
 
     let counter = state.shared_frame_count.take();
@@ -1606,39 +1731,45 @@ mod tests {
 
     #[test]
     fn test_encoder_backlog_covers_the_same_time_at_every_rate() {
-        assert_eq!(encoder_backlog_frames(1), 5);
-        assert_eq!(encoder_backlog_frames(DEFAULT_FPS), 150);
-        assert_eq!(encoder_backlog_frames(MAX_FPS), 300);
-        assert_eq!(encoder_backlog_frames(0), encoder_backlog_frames(1));
+        assert_eq!(encoder_backlog_slots(1), 5);
+        assert_eq!(encoder_backlog_slots(DEFAULT_FPS), 150);
+        assert_eq!(encoder_backlog_slots(MAX_FPS), 300);
+        assert_eq!(encoder_backlog_slots(0), encoder_backlog_slots(1));
     }
 
     #[tokio::test]
     async fn test_write_frames_expands_runs_in_order_then_closes_the_pipe() {
         use tokio::io::AsyncReadExt;
 
-        let (tx, rx) = mpsc::channel(4);
+        let (queue, runs) = EncoderQueue::new(DEFAULT_FPS);
+        let slots = Arc::clone(&queue.slots);
         let (pipe, mut ffmpeg) = tokio::io::duplex(64);
-        let writer = tokio::spawn(write_frames(rx, pipe));
-        tx.send((frame(b"A"), 1)).await.unwrap();
-        tx.send((frame(b"B"), 3)).await.unwrap();
-        drop(tx);
+        let writer = tokio::spawn(write_frames(runs, pipe));
+        queue.send((frame(b"A"), 1)).await.unwrap();
+        queue.send((frame(b"B"), 3)).await.unwrap();
+        drop(queue);
 
         let mut received = Vec::new();
         ffmpeg.read_to_end(&mut received).await.unwrap();
         writer.await.unwrap();
         assert_eq!(received, b"ABBB");
+        // Written runs hand their slots back to the backlog.
+        assert_eq!(
+            slots.available_permits(),
+            encoder_backlog_slots(DEFAULT_FPS) as usize
+        );
     }
 
     #[tokio::test]
     async fn test_write_frames_hangs_up_when_ffmpeg_goes_away() {
-        let (tx, rx) = mpsc::channel(4);
+        let (queue, runs) = EncoderQueue::new(DEFAULT_FPS);
         let (pipe, ffmpeg) = tokio::io::duplex(64);
         drop(ffmpeg);
-        let writer = tokio::spawn(write_frames(rx, pipe));
-        tx.send((frame(b"A"), 1)).await.unwrap();
+        let writer = tokio::spawn(write_frames(runs, pipe));
+        queue.send((frame(b"A"), 1)).await.unwrap();
         writer.await.unwrap();
         // A closed queue is what makes capture stop.
-        assert!(tx.send((frame(b"B"), 1)).await.is_err());
+        assert!(queue.send((frame(b"B"), 1)).await.is_err());
     }
 
     /// The failure this queue exists for: ffmpeg stops reading for a while.
@@ -1646,26 +1777,69 @@ mod tests {
     /// screencast frames) until the backlog is full, and only then wait.
     #[tokio::test]
     async fn test_stalled_encoder_does_not_hold_up_capture_until_backlog_is_full() {
-        let backlog = encoder_backlog_frames(DEFAULT_FPS);
-        let (tx, rx) = mpsc::channel(backlog);
+        use futures_util::FutureExt;
+
+        let (queue, runs) = EncoderQueue::new(DEFAULT_FPS);
         // A pipe that takes one byte and is then never read.
         let (pipe, _unread) = tokio::io::duplex(1);
-        let writer = tokio::spawn(write_frames(rx, pipe));
+        let writer = tokio::spawn(write_frames(runs, pipe));
 
-        tx.send((frame(b"jpeg"), 1)).await.unwrap();
-        while tx.capacity() < backlog {
-            tokio::task::yield_now().await;
+        for _ in 0..encoder_backlog_slots(DEFAULT_FPS) {
+            queue
+                .send((frame(b"jpeg"), 1))
+                .now_or_never()
+                .expect("capture should queue while the encoder is stalled")
+                .unwrap();
         }
-        // The writer is now blocked mid-frame.
-        for _ in 0..backlog {
-            tx.try_send((frame(b"jpeg"), 1))
-                .expect("capture should queue while the encoder is stalled");
-        }
-        assert!(matches!(
-            tx.try_send((frame(b"jpeg"), 1)),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
+        assert!(
+            queue.send((frame(b"jpeg"), 1)).now_or_never().is_none(),
+            "a full backlog makes capture wait"
+        );
         writer.abort();
+    }
+
+    /// A frame held through a gap is one entry but one encode per slot, so
+    /// the backlog counts slots: the longest hold a tick can queue fills it
+    /// as surely as that many distinct frames.
+    #[tokio::test]
+    async fn test_encoder_queue_bounds_held_frames_by_slots() {
+        use futures_util::FutureExt;
+
+        let backlog = encoder_backlog_slots(DEFAULT_FPS);
+        let longest_hold = MAX_BACKFILL_SECS * DEFAULT_FPS as u64 + 1;
+        let (queue, runs) = EncoderQueue::new(DEFAULT_FPS);
+        let (pipe, _unread) = tokio::io::duplex(1);
+        let writer = tokio::spawn(write_frames(runs, pipe));
+
+        queue
+            .send((frame(b"held"), longest_hold))
+            .now_or_never()
+            .expect("an empty backlog takes even the longest hold")
+            .unwrap();
+        assert_eq!(queue.queued_slots(), backlog);
+        for _ in 0..3 {
+            assert!(
+                queue.send((frame(b"next"), 1)).now_or_never().is_none(),
+                "a backlog full of one held frame makes capture wait"
+            );
+        }
+        assert_eq!(queue.queued_slots(), backlog);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn test_drain_encoder_gives_up_on_an_encoder_that_stopped_reading() {
+        let (queue, runs) = EncoderQueue::new(DEFAULT_FPS);
+        let (pipe, _unread) = tokio::io::duplex(1);
+        let writer = tokio::spawn(write_frames(runs, pipe));
+        queue.send((frame(b"jpeg"), 1)).await.unwrap();
+        drop(queue);
+
+        let limit = Duration::from_millis(50);
+        let drained = tokio::time::timeout(limit * 20, drain_encoder(writer, limit))
+            .await
+            .expect("the drain must end at its limit");
+        assert!(drained.unwrap_err().contains("did not finish encoding"));
     }
 
     #[test]
