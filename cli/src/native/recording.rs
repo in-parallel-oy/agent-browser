@@ -24,8 +24,8 @@ pub const DEFAULT_FPS: u32 = 30;
 pub const MAX_FPS: u32 = 60;
 
 /// Rate above which the encoder switches to its high-frame-rate profile:
-/// twice the bitrate budget and a second encoder thread, so the pipe does not
-/// become the bottleneck and stall the capture loop.
+/// twice the bitrate budget and a second encoder thread, so the encoder keeps
+/// pace with capture instead of filling its queue.
 const HIGH_FPS_THRESHOLD: u32 = 30;
 
 /// Bitrate budget for WebM at [`HIGH_FPS_THRESHOLD`], scaled linearly with
@@ -43,6 +43,14 @@ const MAX_BACKFILL_SECS: u64 = 5;
 /// between Chrome's frame clock and the recorder's without letting a lower
 /// recording rate fall behind the page.
 const MAX_PENDING_FRAMES: usize = 2;
+
+/// Seconds of video the encoder may fall behind capture. Chrome sends no new
+/// screencast frame until the previous ones are acknowledged, so capture
+/// acknowledges and times frames as they arrive and queues them for ffmpeg:
+/// an encoder briefly starved of CPU then delays the file instead of the
+/// screencast. A full queue makes capture wait for the encoder again, which
+/// bounds the queue's memory and how long `record stop` spends draining it.
+const MAX_ENCODER_BACKLOG_SECS: u64 = 5;
 
 /// JPEG quality requested from `Page.startScreencast`. Matches the quality the
 /// recorder used to request from `Page.captureScreenshot`.
@@ -62,6 +70,10 @@ const KEYBOARD_EDGE_FADE_SAMPLES: u64 = AUDIO_SAMPLE_RATE as u64 * 10 / 1_000;
 static CLICK_WAV: &[u8] = include_bytes!("../../assets/recording/click.wav");
 static KEYBOARD_WAV: &[u8] = include_bytes!("../../assets/recording/keyboard.wav");
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A frame queued for the encoder and the number of consecutive slots it
+/// fills.
+type SlotRun = (Arc<[u8]>, u64);
 
 #[derive(Clone, Copy, Debug)]
 enum RecordedSound {
@@ -178,6 +190,35 @@ fn frames_due(elapsed: Duration, period: Duration, written: u64) -> u64 {
     let period_us = period.as_micros().max(1);
     let slot = (elapsed.as_micros() / period_us) as u64;
     slot.saturating_add(1).saturating_sub(written)
+}
+
+/// Encoder queue length at `fps`, in entries. An entry fills at least one
+/// slot, so a full queue holds at least [`MAX_ENCODER_BACKLOG_SECS`] of video.
+fn encoder_backlog_frames(fps: u32) -> usize {
+    (MAX_ENCODER_BACKLOG_SECS * fps.clamp(1, MAX_FPS) as u64) as usize
+}
+
+/// Split the `emit` slots owed on one tick into encoder queue entries.
+/// Pending frames go out in arrival order, one slot each, and the last of
+/// them (or the previous frame, when none arrived) holds the remaining
+/// slots as a single entry however long the gap.
+fn fill_slots(
+    pending: &mut VecDeque<Arc<[u8]>>,
+    last: &mut Option<Arc<[u8]>>,
+    emit: u64,
+) -> Vec<SlotRun> {
+    let mut runs = Vec::new();
+    let mut used = 0;
+    while used < emit {
+        if let Some(next) = pending.pop_front() {
+            *last = Some(next);
+        }
+        let Some(frame) = last.clone() else { break };
+        let slots = if pending.is_empty() { emit - used } else { 1 };
+        runs.push((frame, slots));
+        used += slots;
+    }
+    runs
 }
 
 /// The CDP session a recording attaches to its page target for its screencast.
@@ -410,7 +451,9 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
 
     // -hide_banner keeps the version and build banner out of stderr, so a
     // failure message is the cause rather than the configure line.
-    cmd.args(["-y", "-hide_banner"])
+    // -nostats because nothing reads stderr until ffmpeg exits: two progress
+    // lines a second fill the pipe within minutes and wedge the encoder.
+    cmd.args(["-y", "-hide_banner", "-nostats"])
         .args(["-avioflags", "direct"])
         .args([
             "-fpsprobesize",
@@ -435,7 +478,13 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
     if output_extension(output_path).as_deref() == Some("webm") {
         let bitrate = WEBM_BITRATE_KBPS_AT_BASE_FPS
             .max(WEBM_BITRATE_KBPS_AT_BASE_FPS.saturating_mul(fps) / HIGH_FPS_THRESHOLD.max(1));
-        cmd.args(["-c:v", "libvpx", "-crf", "30"])
+        // The realtime deadline lets libvpx pick its speed per frame to fit
+        // a time budget, half the frame period at -cpu-used 8, so a loaded
+        // machine gets a softer picture rather than a backlog. The default
+        // "good" deadline has no budget and is several times slower.
+        cmd.args(["-c:v", "libvpx"])
+            .args(["-deadline", "realtime", "-cpu-used", "8"])
+            .args(["-crf", "30"])
             .args(["-b:v", &format!("{}k", bitrate)]);
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]);
@@ -560,8 +609,9 @@ fn spawn_ffmpeg_command(
 
 /// Spawn a background task that screencasts `capture_session` into the
 /// already running `ffmpeg` at `fps`. Chrome pushes a frame on every repaint up to the display rate; a
-/// wall-clock ticker writes one frame per slot, holding the last one through
-/// gaps, so the file's duration matches the automation it recorded.
+/// wall-clock ticker queues one frame per slot, holding the last one through
+/// gaps, so the file's duration matches the automation it recorded. A second
+/// task drains the queue into ffmpeg, so encoding never delays capture.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
@@ -587,6 +637,8 @@ pub fn spawn_recording_task(
             .stdin
             .take()
             .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+        let (frames_tx, frames_rx) = mpsc::channel(encoder_backlog_frames(fps));
+        let writer = tokio::spawn(write_frames(frames_rx, stdin));
 
         let started = client
             .send_command(
@@ -609,7 +661,7 @@ pub fn spawn_recording_task(
                     &client,
                     &capture_session,
                     events,
-                    stdin,
+                    frames_tx,
                     period,
                     max_frames_per_tick,
                     &shared_count,
@@ -620,7 +672,7 @@ pub fn spawn_recording_task(
                 .await
             }
             Err(e) => {
-                drop(stdin);
+                drop(frames_tx);
                 Err(format!("Failed to start screencast: {}", e))
             }
         };
@@ -635,6 +687,8 @@ pub fn spawn_recording_task(
         .await;
         detach_capture_session(&client, &capture_session).await;
 
+        // ffmpeg sees EOF once the writer has drained what capture queued.
+        let _ = writer.await;
         let output = ffmpeg
             .wait_with_output()
             .await
@@ -651,14 +705,15 @@ pub fn spawn_recording_task(
     })
 }
 
-/// Pump screencast frames into ffmpeg until cancelled, the page goes away, or
-/// the pipe closes. Takes ownership of `stdin` so ffmpeg sees EOF on return.
+/// Pump screencast frames into the encoder queue until cancelled, the page
+/// goes away, or the encoder hangs up. Takes ownership of `frames` so the
+/// writer sees the end of the queue on return.
 #[allow(clippy::too_many_arguments)]
 async fn capture_frames(
     client: &CdpClient,
     capture_session: &str,
     mut events: mpsc::Receiver<super::cdp::types::CdpEvent>,
-    mut stdin: tokio::process::ChildStdin,
+    frames: mpsc::Sender<SlotRun>,
     period: Duration,
     max_frames_per_tick: u64,
     shared_count: &AtomicU64,
@@ -675,8 +730,8 @@ async fn capture_frames(
     // are not phase-locked, so a slot sometimes receives two frames and the
     // next none; the queue carries the spare across instead of dropping it
     // and repeating its predecessor.
-    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut last: Option<Vec<u8>> = None;
+    let mut pending: VecDeque<Arc<[u8]>> = VecDeque::new();
+    let mut last: Option<Arc<[u8]>> = None;
     let mut segment_started: Option<tokio::time::Instant> = None;
     let mut segment_written: u64 = 0;
 
@@ -704,7 +759,7 @@ async fn capture_frames(
                                 .ok()
                         });
                     if let Some(bytes) = decoded {
-                        pending.push_back(bytes);
+                        pending.push_back(Arc::from(bytes));
                         // Only a lower recording rate lets the queue grow (a
                         // 60 Hz screencast into a 30 fps file); dropping the
                         // oldest keeps the picture current.
@@ -738,18 +793,14 @@ async fn capture_frames(
                 // the file. Advancing `written` by the full amount is what
                 // stops the excess being paid off on later ticks.
                 let emit = due.min(max_frames_per_tick);
-                let mut write_failed = false;
-                for _ in 0..emit {
-                    if let Some(next) = pending.pop_front() {
-                        last = Some(next);
-                    }
-                    let Some(frame) = last.as_deref() else { break };
-                    if stdin.write_all(frame).await.is_err() {
-                        write_failed = true;
+                let mut encoder_gone = false;
+                for run in fill_slots(&mut pending, &mut last, emit) {
+                    if frames.send(run).await.is_err() {
+                        encoder_gone = true;
                         break;
                     }
                 }
-                if write_failed {
+                if encoder_gone {
                     break;
                 }
                 segment_written += due;
@@ -758,8 +809,24 @@ async fn capture_frames(
         }
     }
 
-    drop(stdin);
+    drop(frames);
     Ok(())
+}
+
+/// Write queued frames to ffmpeg until capture closes the queue or the pipe
+/// breaks. Returning drops the queue, which is how a dead encoder ends
+/// capture, and drops `stdin`, which is ffmpeg's EOF.
+async fn write_frames<W>(mut frames: mpsc::Receiver<SlotRun>, mut stdin: W)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while let Some((frame, slots)) = frames.recv().await {
+        for _ in 0..slots {
+            if stdin.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Add recorded interaction sounds to a completed Chromium screencast. The
@@ -1437,6 +1504,168 @@ mod tests {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
         assert_eq!(threads, Some("1"));
+    }
+
+    fn ffmpeg_args(output_path: &str, fps: u32) -> Vec<String> {
+        build_ffmpeg_command(output_path, fps)
+            .as_std()
+            .get_args()
+            .filter_map(|a| a.to_str().map(String::from))
+            .collect()
+    }
+
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn test_build_ffmpeg_command_webm_encodes_on_a_realtime_budget() {
+        for fps in [DEFAULT_FPS, MAX_FPS] {
+            let args = ffmpeg_args("/tmp/out.webm", fps);
+            assert_eq!(arg_after(&args, "-deadline"), Some("realtime"));
+            assert_eq!(arg_after(&args, "-cpu-used"), Some("8"));
+            // Quality and bitrate targets are unchanged by the deadline.
+            assert_eq!(arg_after(&args, "-crf"), Some("30"));
+        }
+        // libx264 is already on its fastest preset; libvpx options stay off it.
+        let args = ffmpeg_args("/tmp/out.mp4", DEFAULT_FPS);
+        assert_eq!(arg_after(&args, "-preset"), Some("ultrafast"));
+        assert!(!args.iter().any(|a| a == "-deadline" || a == "-cpu-used"));
+    }
+
+    #[test]
+    fn test_build_ffmpeg_command_suppresses_progress_stats() {
+        // stderr is read only after ffmpeg exits, so periodic progress lines
+        // would eventually fill the pipe and block the encoder.
+        for path in ["/tmp/out.webm", "/tmp/out.mp4"] {
+            let args = ffmpeg_args(path, DEFAULT_FPS);
+            assert!(args.iter().any(|a| a == "-nostats"), "{path}");
+        }
+    }
+
+    fn frame(bytes: &[u8]) -> Arc<[u8]> {
+        Arc::from(bytes)
+    }
+
+    fn slot_runs(queued: &[SlotRun]) -> Vec<(&[u8], u64)> {
+        queued.iter().map(|(f, n)| (&f[..], *n)).collect()
+    }
+
+    #[test]
+    fn test_fill_slots_holds_the_last_frame_through_a_gap_as_one_run() {
+        let mut pending = VecDeque::new();
+        let mut last = Some(frame(b"A"));
+        let queued = fill_slots(&mut pending, &mut last, MAX_BACKFILL_SECS * 30 + 1);
+        assert_eq!(
+            slot_runs(&queued),
+            vec![(&b"A"[..], MAX_BACKFILL_SECS * 30 + 1)]
+        );
+    }
+
+    #[test]
+    fn test_fill_slots_writes_pending_frames_in_order_before_holding() {
+        let mut pending = VecDeque::from([frame(b"A"), frame(b"B")]);
+        let mut last = Some(frame(b"Z"));
+        let queued = fill_slots(&mut pending, &mut last, 4);
+        assert_eq!(slot_runs(&queued), vec![(&b"A"[..], 1), (&b"B"[..], 3)]);
+        assert!(pending.is_empty());
+        assert_eq!(last.as_deref(), Some(&b"B"[..]));
+    }
+
+    #[test]
+    fn test_fill_slots_carries_a_spare_frame_to_the_next_tick() {
+        let mut pending = VecDeque::from([frame(b"A"), frame(b"B")]);
+        let mut last = None;
+        assert_eq!(
+            slot_runs(&fill_slots(&mut pending, &mut last, 1)),
+            vec![(&b"A"[..], 1)]
+        );
+        assert_eq!(
+            slot_runs(&fill_slots(&mut pending, &mut last, 1)),
+            vec![(&b"B"[..], 1)]
+        );
+        assert!(fill_slots(&mut VecDeque::new(), &mut None, 3).is_empty());
+    }
+
+    /// The timeline is decided by the ticker, not the encoder: every slot a
+    /// tick owes is queued exactly once, whatever mix of new and held frames
+    /// fills it.
+    #[test]
+    fn test_fill_slots_queues_exactly_the_slots_owed() {
+        for (arrived, emit) in [(0, 1), (0, 7), (1, 1), (1, 5), (2, 1), (2, 2), (2, 9)] {
+            let mut pending: VecDeque<_> = (0..arrived).map(|i| frame(&[i])).collect();
+            let mut last = Some(frame(b"held"));
+            let queued = fill_slots(&mut pending, &mut last, emit);
+            let slots: u64 = queued.iter().map(|(_, n)| n).sum();
+            assert_eq!(slots, emit, "{arrived} arrived, {emit} owed");
+        }
+    }
+
+    #[test]
+    fn test_encoder_backlog_covers_the_same_time_at_every_rate() {
+        assert_eq!(encoder_backlog_frames(1), 5);
+        assert_eq!(encoder_backlog_frames(DEFAULT_FPS), 150);
+        assert_eq!(encoder_backlog_frames(MAX_FPS), 300);
+        assert_eq!(encoder_backlog_frames(0), encoder_backlog_frames(1));
+    }
+
+    #[tokio::test]
+    async fn test_write_frames_expands_runs_in_order_then_closes_the_pipe() {
+        use tokio::io::AsyncReadExt;
+
+        let (tx, rx) = mpsc::channel(4);
+        let (pipe, mut ffmpeg) = tokio::io::duplex(64);
+        let writer = tokio::spawn(write_frames(rx, pipe));
+        tx.send((frame(b"A"), 1)).await.unwrap();
+        tx.send((frame(b"B"), 3)).await.unwrap();
+        drop(tx);
+
+        let mut received = Vec::new();
+        ffmpeg.read_to_end(&mut received).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(received, b"ABBB");
+    }
+
+    #[tokio::test]
+    async fn test_write_frames_hangs_up_when_ffmpeg_goes_away() {
+        let (tx, rx) = mpsc::channel(4);
+        let (pipe, ffmpeg) = tokio::io::duplex(64);
+        drop(ffmpeg);
+        let writer = tokio::spawn(write_frames(rx, pipe));
+        tx.send((frame(b"A"), 1)).await.unwrap();
+        writer.await.unwrap();
+        // A closed queue is what makes capture stop.
+        assert!(tx.send((frame(b"B"), 1)).await.is_err());
+    }
+
+    /// The failure this queue exists for: ffmpeg stops reading for a while.
+    /// Capture must still be able to queue (and so keep acknowledging
+    /// screencast frames) until the backlog is full, and only then wait.
+    #[tokio::test]
+    async fn test_stalled_encoder_does_not_hold_up_capture_until_backlog_is_full() {
+        let backlog = encoder_backlog_frames(DEFAULT_FPS);
+        let (tx, rx) = mpsc::channel(backlog);
+        // A pipe that takes one byte and is then never read.
+        let (pipe, _unread) = tokio::io::duplex(1);
+        let writer = tokio::spawn(write_frames(rx, pipe));
+
+        tx.send((frame(b"jpeg"), 1)).await.unwrap();
+        while tx.capacity() < backlog {
+            tokio::task::yield_now().await;
+        }
+        // The writer is now blocked mid-frame.
+        for _ in 0..backlog {
+            tx.try_send((frame(b"jpeg"), 1))
+                .expect("capture should queue while the encoder is stalled");
+        }
+        assert!(matches!(
+            tx.try_send((frame(b"jpeg"), 1)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        writer.abort();
     }
 
     #[test]

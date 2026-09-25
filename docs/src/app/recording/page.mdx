@@ -94,6 +94,14 @@ Valid rates are 1 to 60. Frames come from Chrome's screencast, so every repaint 
 
 `record stop` reports `frames` (written to the file) and `capturedFrames` (distinct frames the page produced). A static page shows a small `capturedFrames` against a full `frames` count; that is the hold working.
 
+### Under CPU load
+
+Chrome sends no new screencast frame until the previous ones are acknowledged, so a recorder that waits on its encoder freezes the video while the page itself keeps animating. The recorder therefore acknowledges and times each frame as it arrives and queues it for ffmpeg, which encodes on its own task. An encoder that briefly loses the CPU falls behind by up to five seconds of video without costing a frame. Past that, capture waits for the encoder, and the frames missed in that time show as held frames. The file still matches wall-clock time. `record stop` returns once the encoder has worked through the queue, which never holds more than those five seconds.
+
+WebM is encoded with libvpx's `realtime` deadline, which adjusts its speed so each frame fits in half the frame period. On a busy machine the picture gets softer instead of choppier. MP4 already uses libx264's fastest preset.
+
+Encoding everything after `record stop` was rejected. The stop time and the spool on disk would both grow with the length of the take, and a long take would run past the CLI's 30-second response limit. A smaller or lower-quality screencast was also rejected, because it would make every recording worse to fix a problem that only happens under load.
+
 ## Commands
 
 <table>
