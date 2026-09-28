@@ -1,5 +1,14 @@
 # agent-browser
 
+## 0.37.0-fork.2
+
+Fork release.
+
+### Bug Fixes
+
+- Fixed **recordings stuttering on a busy machine**. Capture wrote each frame to ffmpeg itself, so while the encoder fell behind no screencast frame was acknowledged and Chrome stopped sending them; the video held frames for up to half a second while the page kept rendering at 60 fps. A separate writer now feeds ffmpeg from a queue of up to 5 s of video, and WebM encodes with libvpx's realtime deadline. On an 8-vCPU VM with 6 cores busy, a 6 s take went from 118–144 distinct frames with 9-frame holds to every frame distinct, and `record stop` from about 1.8 s to under 0.1 s.
+- Fixed **long recordings hanging**. Nothing read ffmpeg's progress output, which filled its pipe after about 5–6 minutes and stopped the encoder; ffmpeg now runs with `-nostats`. A stop gives up after 15 s if ffmpeg stops reading, and `record abort` discards the queue instead of encoding it.
+
 ## 0.37.0-fork.1
 
 Fork release merging upstream 0.37.0.
