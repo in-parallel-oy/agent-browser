@@ -1963,6 +1963,19 @@ Optional configuration via environment variables:
 
 When enabled, agent-browser connects to an AgentCore cloud browser session instead of launching a local browser. All commands work identically.
 
+## Fork release workflow
+
+This fork keeps only [Fork GitHub Release](.github/workflows/fork-release.yml), triggered manually from GitHub Actions after updating and syncing the package version. Pushes and pull requests do not trigger CI, and the workflow publishes binaries to this fork's GitHub releases without publishing to npm.
+
+| Release binary | Runner |
+| --- | --- |
+| Linux x64, glibc 2.28+ | `avrea-ubuntu-latest-2-vcpu` |
+| macOS ARM64 (Apple Silicon) | `avrea-macos-26-8-vcpu` |
+
+Both builds include the dashboard and verify the executable's version before uploading. The release job creates or updates `v<package.json version>` with those two binaries. New tags point to the workflow's commit. Avrea's GitHub App must have access to `in-parallel-oy/agent-browser` for these jobs to start.
+
+The macOS build uses a native [Avrea macOS runner](https://docs.avrea.com/runners/#macos) so the Apple SDK is available and the built executable can run before release. Building both targets on Linux is possible with [cargo-zigbuild and a macOS SDK](https://github.com/rust-cross/cargo-zigbuild), but would require maintaining the SDK and a separate macOS execution check.
+
 ## License
 
 Apache-2.0

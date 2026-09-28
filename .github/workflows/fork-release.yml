@@ -11,7 +11,7 @@ permissions:
 jobs:
   version:
     name: Read version
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest-2-vcpu
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -19,6 +19,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
 
       - name: Read package version
         id: version
@@ -32,18 +37,20 @@ jobs:
     name: Build ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Linux x64
-            os: ubuntu-latest
+            os: avrea-ubuntu-latest-2-vcpu
             rust_target: x86_64-unknown-linux-gnu
             build_target: x86_64-unknown-linux-gnu.2.28
             binary: agent-browser-linux-x64
             use_zigbuild: true
           - name: macOS ARM64
-            os: macos-latest
+            # A native macOS runner supplies the Apple SDK and can smoke-test the binary.
+            os: avrea-macos-26-8-vcpu
             rust_target: aarch64-apple-darwin
             build_target: aarch64-apple-darwin
             binary: agent-browser-darwin-arm64
@@ -62,7 +69,7 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
 
-      - name: Install npm dependencies
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Sync version
@@ -76,29 +83,11 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install cross-compilation tools
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu mingw-w64
-
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
         run: |
-          pip3 install ziglang
+          pip3 install ziglang==0.16.0
           cargo install cargo-zigbuild --version 0.22.3 --locked
-
-      - name: Configure Rust linkers
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-
-          [target.x86_64-pc-windows-gnu]
-          linker = "x86_64-w64-mingw32-gcc"
-          EOF
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -107,24 +96,28 @@ jobs:
 
       - name: Build with zigbuild
         if: matrix.use_zigbuild
-        run: cargo zigbuild --release --manifest-path cli/Cargo.toml --target ${{ matrix.build_target }}
+        run: cargo zigbuild --locked --release --manifest-path cli/Cargo.toml --target ${{ matrix.build_target }}
 
       - name: Build with cargo
         if: '!matrix.use_zigbuild'
-        run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.rust_target }}
+        run: cargo build --locked --release --manifest-path cli/Cargo.toml --target ${{ matrix.rust_target }}
 
       - name: Copy binary
         run: |
           mkdir -p artifacts
-          if [[ "${{ matrix.rust_target }}" == *"windows"* ]]; then
-            cp cli/target/${{ matrix.rust_target }}/release/agent-browser.exe artifacts/${{ matrix.binary }}
-          else
-            cp cli/target/${{ matrix.rust_target }}/release/agent-browser artifacts/${{ matrix.binary }}
-            chmod +x artifacts/${{ matrix.binary }}
-          fi
+          cp cli/target/${{ matrix.rust_target }}/release/agent-browser artifacts/${{ matrix.binary }}
+          chmod +x artifacts/${{ matrix.binary }}
+
+      - name: Verify binary version
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ACTUAL_VERSION=$(artifacts/${{ matrix.binary }} --version)
+          echo "$ACTUAL_VERSION"
+          test "$ACTUAL_VERSION" = "agent-browser $EXPECTED_VERSION"
 
       - name: Verify Linux GNU glibc floor
-        if: matrix.binary == 'agent-browser-linux-x64' || matrix.binary == 'agent-browser-linux-arm64'
+        if: matrix.binary == 'agent-browser-linux-x64'
         run: |
           set -euo pipefail
           if objdump -p artifacts/${{ matrix.binary }} | grep -E 'GLIBC_2\.([3-9][0-9]|29)'; then
@@ -138,12 +131,13 @@ jobs:
         with:
           name: ${{ matrix.binary }}
           path: artifacts/${{ matrix.binary }}
+          if-no-files-found: error
           retention-days: 7
 
   github-release:
     name: Create GitHub Release
     needs: [version, build-binaries]
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest-2-vcpu
     timeout-minutes: 10
     permissions:
       contents: write
@@ -155,52 +149,48 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-
-      - name: Move binaries to bin directory
-        run: |
-          mkdir -p bin
-          find artifacts -type f -name 'agent-browser-*' -exec mv {} bin/ \;
-          rm -rf artifacts
-          chmod +x bin/agent-browser-* 2>/dev/null || true
-          ls -la bin/
+          pattern: agent-browser-*
+          merge-multiple: true
 
       - name: Verify binaries exist
         run: |
-          BINARY_COUNT=$(ls bin/agent-browser-* 2>/dev/null | wc -l)
-          if [ "$BINARY_COUNT" -lt 2 ]; then
-            echo "Error: Expected 2 binaries, found $BINARY_COUNT"
-            ls -la bin/
-            exit 1
-          fi
-          echo "Found $BINARY_COUNT binaries"
+          for binary in agent-browser-linux-x64 agent-browser-darwin-arm64; do
+            if [ ! -s "artifacts/$binary" ]; then
+              echo "Error: Missing or empty release binary: $binary"
+              exit 1
+            fi
+            chmod +x "artifacts/$binary"
+          done
 
       - name: Write release notes
         run: |
           cat > /tmp/release-notes.md << 'EOF'
           Fork release with prebuilt binaries for in-parallel-oy/agent-browser.
 
-          Includes upstream agent-browser plus the fork cursor overlay changes for recordings.
+          Includes upstream agent-browser plus the fork recording changes, for Linux x64 and macOS ARM64.
 
           Install from the fork without compiling:
 
           ```bash
-          npm install -g github:in-parallel-oy/agent-browser
+          pnpm add --global github:in-parallel-oy/agent-browser
           ```
           EOF
 
       - name: Create GitHub Release
         run: |
-          TAG="${{ needs.version.outputs.tag }}"
+          BINARIES=(artifacts/agent-browser-linux-x64 artifacts/agent-browser-darwin-arm64)
 
           if gh release view "$TAG" &>/dev/null; then
             echo "Release $TAG already exists, uploading assets..."
-            gh release upload "$TAG" bin/agent-browser-* --clobber
+            gh release upload "$TAG" "${BINARIES[@]}" --clobber
           else
             echo "Creating release $TAG..."
             gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
               --title "$TAG" \
               --notes-file /tmp/release-notes.md \
-              bin/agent-browser-*
+              "${BINARIES[@]}"
           fi
         env:
+          TAG: ${{ needs.version.outputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
